@@ -18,6 +18,9 @@ public partial class Form1 : Form
     private PgnGame _currentGame = new();
     private GameAnalysis? _currentAnalysis;
     private int _currentPlyIndex = -1;
+    private PieceColor _userColor = PieceColor.White;
+    private string _rawPgnText = string.Empty;
+    private int _analysisDepth = 14;
 
     // --- UI Controls ---
     // Left/Center Viewport (Board + Players + EvalBar)
@@ -39,29 +42,31 @@ public partial class Form1 : Form
 
     // Top Header Bar
     private Label _lblLogoTitle = null!;
-    private Label _lblLogoSubtitle = null!;
-    private Label _lblEngineStatus = null!;
     private Label _lblGameTitle = null!;
+    private RoundedButton _btnLoadPgn = null!;
     private RoundedButton _btnDownloadUser = null!;
-    private RoundedButton _btnAnalyze = null!;
-    private RoundedButton _btnStop = null!;
-    private RoundedButton _btnToggleSettings = null!;
     private ProgressBar _progressBar = null!;
+
+    // Full-Width Evaluation Graph (Across Top)
+    private GameGraphControl _graphControl = null!;
 
     // Move Review Variation Banner
     private Panel _pnlVariationBanner = null!;
     private Label _lblVariationTitle = null!;
     private RoundedButton _btnExitVariation = null!;
 
-    // Right Sidebar (Chess.com Review Panel)
+    // Right Sidebar
     private Panel _sidebarContainer = null!;
     private Panel _sidebarHeader = null!;
     private Label _lblSidebarTitle = null!;
     private RoundedButton _btnBackToOverview = null!;
+    private RoundedButton _btnShowOverview = null!;
+    private RoundedButton _btnQuickAnalyze = null!;
+    private RoundedButton _btnSettingsGear = null!;
+    private ContextMenuStrip _menuSettings = null!;
 
-    // View A: Overview Panel
+    // View A: Overview Panel (Report)
     private Panel _pnlOverview = null!;
-    private GameGraphControl _graphControl = null!;
     private Label _lblOverviewWhitePlayer = null!;
     private Label _lblOverviewBlackPlayer = null!;
     private Label _lblWhiteAccuracy = null!;
@@ -73,15 +78,7 @@ public partial class Form1 : Form
 
     // View B: Move-by-Move Review Panel
     private Panel _pnlMoveReview = null!;
-    private Panel _coachBubbleCard = null!;
-    private PictureBox _picBubbleBadge = null!;
-    private Label _lblBubbleMoveTitle = null!;
-    private Label _lblBubbleEvalPill = null!;
-    private Label _lblBubbleComment = null!;
-    private RoundedButton _btnReviewBestMove = null!;
-    private RoundedButton _btnReviewNext = null!;
     private MoveHistoryControl _moveHistory = null!;
-    private GameGraphControl _miniGraphControl = null!;
 
     // Playback Bar in Review
     private RoundedButton _btnFirst = null!;
@@ -89,21 +86,11 @@ public partial class Form1 : Form
     private RoundedButton _btnAutoPlay = null!;
     private RoundedButton _btnNext = null!;
     private RoundedButton _btnLast = null!;
-    private RoundedButton _btnFlipReview = null!;
-    private RoundedButton _btnToggleArrows = null!;
-    private RoundedButton _btnToggleSound = null!;
     private System.Windows.Forms.Timer _autoPlayTimer = null!;
 
     // Reactive Variation Engine Analysis
     private CancellationTokenSource? _variationCts;
     private readonly List<string> _variationMoves = new();
-
-    // View C: Settings & PGN Panel
-    private Panel _pnlSettings = null!;
-    private TextBox _txtPgnInput = null!;
-    private TextBox _txtEnginePath = null!;
-    private NumericUpDown _numDepth = null!;
-    private NumericUpDown _numThreads = null!;
 
     public Form1()
     {
@@ -112,7 +99,15 @@ public partial class Form1 : Form
         SoundService.Initialize();
         Task.Run(() => OpeningBook.Initialize());
         InitializeEngine();
-        LoadSampleGame();
+
+        // Start with clean empty board position
+        _boardControl.Board = new BoardState();
+        _evalBar.Reset();
+        _lblGameTitle.Text = "Загрузите партию";
+        UpdatePlayerBarLabels("Белые", "Черные");
+        _lblTopClock.Text = "";
+        _lblBottomClock.Text = "";
+        SwitchSidebarView("review");
     }
 
     private void SetupCustomUi()
@@ -142,106 +137,89 @@ public partial class Form1 : Form
             }
         };
 
-        // 1. Top Bar Panel (Header with logo and action buttons)
+        // 1. Top Bar Panel (Header with 2 action buttons)
         var topBar = CreateTopBar();
 
-        // 2. Main Area (Left = Board Viewport, Right = Sidebar)
+        // 2. Full-Width Evaluation Graph
+        _graphControl = new GameGraphControl
+        {
+            Dock = DockStyle.Top,
+            Height = 72,
+            BackColor = ChessTheme.PanelDarker
+        };
+        _graphControl.PlySelected += ply =>
+        {
+            GoToPly(ply);
+            SwitchSidebarView("review");
+        };
+
+        // 3. Main Area (Left = Board Viewport, Right = Sidebar)
         var mainArea = new Panel
         {
             Dock = DockStyle.Fill,
             BackColor = ChessTheme.BackgroundDark
         };
 
-        // Right Sidebar (Fixed width ~430px)
+        // Right Sidebar (Width 490px per Phase 6)
         _sidebarContainer = CreateRightSidebar();
         _sidebarContainer.Dock = DockStyle.Right;
 
-        // Left Board Viewport (Fills remaining width and full height!)
+        // Left Board Viewport (Fills remaining space)
         var boardViewport = CreateBoardViewport();
         boardViewport.Dock = DockStyle.Fill;
 
         mainArea.Controls.Add(boardViewport);
         mainArea.Controls.Add(_sidebarContainer);
 
+        // WinForms Dock Order: mainArea (Fill) -> graph (Top) -> topBar (Top)
         Controls.Add(mainArea);
+        Controls.Add(_graphControl);
         Controls.Add(topBar);
     }
 
-    #region Top Header Bar
+    #region Top Header Bar (Phase 2)
     private Panel CreateTopBar()
     {
         var topBar = new Panel
         {
             Dock = DockStyle.Top,
-            Height = 54,
+            Height = 48,
             BackColor = ChessTheme.PanelDarker,
-            Padding = new Padding(14, 8, 14, 8)
+            Padding = new Padding(16, 6, 16, 6)
         };
 
         topBar.Paint += (s, e) =>
         {
-            // Subtle bottom border
             using var borderPen = new Pen(ChessTheme.BorderColor, 1f);
             e.Graphics.DrawLine(borderPen, 0, topBar.Height - 1, topBar.Width, topBar.Height - 1);
         };
 
-        // Logo Container (Left)
-        var pnlLogo = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Left,
-            AutoSize = true,
-            FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = false,
-            BackColor = Color.Transparent,
-            Cursor = Cursors.Hand,
-            Padding = new Padding(12, 11, 12, 0)
-        };
-        pnlLogo.Click += (s, e) => SwitchSidebarView("overview");
-
+        // Logo Title on Left
         _lblLogoTitle = new Label
         {
             Text = "♔ ChessAnalysis",
-            Font = new Font("Segoe UI", 12.5f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 12f, FontStyle.Bold),
             ForeColor = Color.White,
             AutoSize = true,
-            Cursor = Cursors.Hand,
-            Margin = new Padding(0, 0, 8, 0)
+            Dock = DockStyle.Left,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Cursor = Cursors.Hand
         };
-        _lblLogoTitle.Click += (s, e) => SwitchSidebarView("overview");
-
-        _lblLogoSubtitle = new Label
-        {
-            Text = "by Antigravity",
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-            ForeColor = ChessTheme.AccentGreen,
-            AutoSize = true,
-            Cursor = Cursors.Hand,
-            Margin = new Padding(0, 4, 16, 0)
-        };
-        _lblLogoSubtitle.Click += (s, e) => SwitchSidebarView("overview");
-
-        pnlLogo.Controls.Add(_lblLogoTitle);
-        pnlLogo.Controls.Add(_lblLogoSubtitle);
+        _lblLogoTitle.Click += (s, e) => SwitchSidebarView("review");
 
         // Game Match / Opening Title
         _lblGameTitle = new Label
         {
-            Text = "Партия не загружена",
+            Text = "Загрузите партию",
             Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
-            ForeColor = Color.FromArgb(205, 205, 205),
+            ForeColor = Color.FromArgb(190, 190, 190),
             AutoSize = true,
             Dock = DockStyle.Left,
             TextAlign = ContentAlignment.MiddleLeft,
-            Padding = new Padding(10, 0, 0, 0)
+            Padding = new Padding(16, 0, 0, 0)
         };
 
-        // Engine Status (kept invisible per user request to clean up header)
-        _lblEngineStatus = new Label
-        {
-            Visible = false
-        };
-
-        // Action Buttons (Right) - FlowLayoutPanel guarantees zero overlapping!
+        // Action Buttons on Right
         var flowButtons = new FlowLayoutPanel
         {
             Dock = DockStyle.Right,
@@ -252,84 +230,58 @@ public partial class Form1 : Form
             Margin = new Padding(0)
         };
 
-        _btnDownloadUser = new RoundedButton
+        _btnLoadPgn = new RoundedButton
         {
-            Text = "Скачать по нику",
-            Width = 145,
-            Height = 36,
-            BorderRadius = 6,
-            NormalColor = Color.FromArgb(45, 43, 40),
-            HoverColor = Color.FromArgb(58, 56, 52),
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-            Margin = new Padding(4, 0, 4, 0)
-        };
-        _btnDownloadUser.Click += (s, e) => OpenDownloadUserDialog();
-
-        _btnAnalyze = new RoundedButton
-        {
-            Text = "Начать анализ",
+            Text = "Загрузить PGN",
             Width = 140,
-            Height = 36,
+            Height = 34,
             BorderRadius = 6,
             NormalColor = ChessTheme.AccentGreen,
             HoverColor = ChessTheme.AccentGreenHover,
-            PressedColor = Color.FromArgb(105, 155, 60),
+            PressedColor = Color.FromArgb(100, 150, 55),
             Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+            ForeColor = Color.White,
             Margin = new Padding(4, 0, 4, 0)
         };
-        _btnAnalyze.Click += async (s, e) => await StartAnalysisAsync();
+        _btnLoadPgn.Click += (s, e) => OpenLoadPgnDialog();
 
-        _btnStop = new RoundedButton
+        _btnDownloadUser = new RoundedButton
         {
-            Text = "Стоп",
-            Width = 72,
-            Height = 36,
+            Text = "Поиск по нику",
+            Width = 140,
+            Height = 34,
             BorderRadius = 6,
-            NormalColor = ChessTheme.AccentRed,
-            HoverColor = Color.FromArgb(215, 75, 62),
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-            Margin = new Padding(4, 0, 4, 0),
-            Enabled = false
+            NormalColor = Color.FromArgb(48, 46, 43),
+            HoverColor = Color.FromArgb(62, 60, 56),
+            PressedColor = Color.FromArgb(75, 73, 68),
+            Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+            ForeColor = Color.White,
+            Margin = new Padding(4, 0, 0, 0)
         };
-        _btnStop.Click += (s, e) => StopAnalysis();
+        _btnDownloadUser.Click += (s, e) => OpenDownloadUserDialog();
 
-        _btnToggleSettings = new RoundedButton
-        {
-            Text = "PGN / Настройки",
-            Width = 145,
-            Height = 36,
-            BorderRadius = 6,
-            NormalColor = Color.FromArgb(45, 43, 40),
-            HoverColor = Color.FromArgb(58, 56, 52),
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-            Margin = new Padding(4, 0, 4, 0)
-        };
-        _btnToggleSettings.Click += (s, e) => SwitchSidebarView("settings");
+        flowButtons.Controls.Add(_btnLoadPgn);
+        flowButtons.Controls.Add(_btnDownloadUser);
 
+        // Sleek 3px analysis progress indicator flush to the bottom edge
         _progressBar = new ProgressBar
         {
-            Width = 110,
-            Height = 22,
+            Dock = DockStyle.Bottom,
+            Height = 3,
             Style = ProgressBarStyle.Continuous,
-            Visible = false,
-            Margin = new Padding(4, 7, 4, 0)
+            Visible = false
         };
-
-        flowButtons.Controls.Add(_btnDownloadUser);
-        flowButtons.Controls.Add(_btnAnalyze);
-        flowButtons.Controls.Add(_btnStop);
-        flowButtons.Controls.Add(_btnToggleSettings);
-        flowButtons.Controls.Add(_progressBar);
 
         topBar.Controls.Add(flowButtons);
         topBar.Controls.Add(_lblGameTitle);
-        topBar.Controls.Add(pnlLogo);
+        topBar.Controls.Add(_lblLogoTitle);
+        topBar.Controls.Add(_progressBar);
 
         return topBar;
     }
     #endregion
 
-    #region Board Viewport (Adaptive 1:1 Board + Player Bars + Eval Bar)
+    #region Board Viewport (Phase 8 EvalBar: 36px)
     private Control CreateBoardViewport()
     {
         var viewport = new Panel
@@ -344,10 +296,10 @@ public partial class Form1 : Form
         // 2. Bottom Player Bar
         _bottomPlayerBar = CreatePlayerBar(isTop: false);
 
-        // 3. Eval Bar flush to board
+        // 3. Eval Bar flush to board (36px width per Phase 8)
         _evalBar = new EvalBarControl
         {
-            Width = 24
+            Width = 36
         };
 
         // 4. Square Chess Board
@@ -374,8 +326,8 @@ public partial class Form1 : Form
         if (availW <= 100 || availH <= 100) return;
 
         int playerBarH = 38;
-        int evalBarW = 24;
-        int gap = 6;
+        int evalBarW = 36;
+        int gap = 8;
         int verticalGap = 4;
 
         // Board is strictly 1:1 square
@@ -386,22 +338,15 @@ public partial class Form1 : Form
         int totalW = evalBarW + gap + boardSize;
         int totalH = playerBarH + verticalGap + boardSize + verticalGap + playerBarH;
 
-        int startX = padX + Math.Max(0, (availW - totalW) / 2); // Center board viewport horizontally
+        int startX = padX + Math.Max(0, (availW - totalW) / 2);
         int startY = padY + Math.Max(0, (availH - totalH) / 2);
 
         int boardX = startX + evalBarW + gap;
         int boardY = startY + playerBarH + verticalGap;
 
-        // 1. Top player bar directly above board
         _topPlayerBar.SetBounds(startX, startY, totalW, playerBarH);
-
-        // 2. Eval bar flush against the board with exact matching height
         _evalBar.SetBounds(startX, boardY, evalBarW, boardSize);
-
-        // 3. Square Chess Board
         _boardControl.SetBounds(boardX, boardY, boardSize, boardSize);
-
-        // 4. Bottom player bar directly below board
         _bottomPlayerBar.SetBounds(startX, boardY + boardSize + verticalGap, totalW, playerBarH);
     }
 
@@ -437,7 +382,7 @@ public partial class Form1 : Form
 
         var lblPlayer = new Label
         {
-            Text = isTop ? "Черные (Игрок)" : "Белые (Игрок)",
+            Text = isTop ? "Черные" : "Белые",
             Font = new Font("Segoe UI", 10f, FontStyle.Bold),
             ForeColor = Color.White,
             AutoSize = true
@@ -449,7 +394,6 @@ public partial class Form1 : Form
             Width = 220
         };
 
-        // Clock timer pill on right
         var clockPill = new Panel
         {
             Size = new Size(76, 28),
@@ -467,7 +411,7 @@ public partial class Form1 : Form
 
         var lblClock = new Label
         {
-            Text = "10:00",
+            Text = "",
             Font = new Font("Consolas", 10.5f, FontStyle.Bold),
             ForeColor = Color.White,
             Dock = DockStyle.Fill,
@@ -492,7 +436,6 @@ public partial class Form1 : Form
         bar.Resize += (s, e) => LayoutBar();
         lblPlayer.TextChanged += (s, e) => LayoutBar();
 
-        // Keep references
         if (isTop)
         {
             _topAvatar = avatar;
@@ -512,21 +455,23 @@ public partial class Form1 : Form
     }
     #endregion
 
-    #region Right Sidebar (Overview, Move-by-Move Review, Settings)
+    #region Right Sidebar (Overview & Move Review)
     private Panel CreateRightSidebar()
     {
         var sidebar = new Panel
         {
-            Width = 470,
+            Width = 490,
             BackColor = ChessTheme.PanelDark
         };
 
         sidebar.Paint += (s, e) =>
         {
-            // Left dividing border
             using var borderPen = new Pen(ChessTheme.BorderColor, 1.2f);
             e.Graphics.DrawLine(borderPen, 0, 0, 0, sidebar.Height);
         };
+
+        // Settings Gear Context Menu
+        _menuSettings = CreateSettingsMenu();
 
         // 1. Sidebar Header Bar
         _sidebarHeader = new Panel
@@ -539,9 +484,9 @@ public partial class Form1 : Form
 
         _btnBackToOverview = new RoundedButton
         {
-            Text = "← Назад",
-            Width = 78,
-            Height = 28,
+            Text = "← К ходам",
+            Width = 86,
+            Height = 30,
             BorderRadius = 5,
             NormalColor = Color.FromArgb(48, 46, 43),
             HoverColor = Color.FromArgb(62, 60, 56),
@@ -549,19 +494,74 @@ public partial class Form1 : Form
             Dock = DockStyle.Left,
             Visible = false
         };
-        _btnBackToOverview.Click += (s, e) => SwitchSidebarView("overview");
+        _btnBackToOverview.Click += (s, e) => SwitchSidebarView("review");
+
+        _btnQuickAnalyze = new RoundedButton
+        {
+            Text = "🔍",
+            Width = 32,
+            Height = 30,
+            BorderRadius = 6,
+            NormalColor = ChessTheme.AccentGreen,
+            HoverColor = ChessTheme.AccentGreenHover,
+            PressedColor = Color.FromArgb(100, 150, 55),
+            Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
+            ForeColor = Color.White,
+            Dock = DockStyle.Left,
+            Margin = new Padding(0, 0, 8, 0)
+        };
+        var ttAnalyze = new ToolTip();
+        ttAnalyze.SetToolTip(_btnQuickAnalyze, "Запустить анализ партии движком Stockfish");
+        _btnQuickAnalyze.Click += async (s, e) => await StartAnalysisAsync();
+
+        _btnShowOverview = new RoundedButton
+        {
+            Text = "⭐ Отчет",
+            Width = 74,
+            Height = 30,
+            BorderRadius = 5,
+            NormalColor = Color.FromArgb(48, 46, 43),
+            HoverColor = Color.FromArgb(62, 60, 56),
+            Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+            Dock = DockStyle.Left,
+            Margin = new Padding(6, 0, 0, 0)
+        };
+        _btnShowOverview.Click += (s, e) => SwitchSidebarView("overview");
+
+        _btnSettingsGear = new RoundedButton
+        {
+            Text = "⚙",
+            Width = 32,
+            Height = 30,
+            BorderRadius = 6,
+            NormalColor = Color.FromArgb(48, 46, 43),
+            HoverColor = Color.FromArgb(62, 60, 56),
+            PressedColor = Color.FromArgb(75, 73, 68),
+            Font = new Font("Segoe UI", 11.5f, FontStyle.Bold),
+            ForeColor = Color.White,
+            Dock = DockStyle.Right
+        };
+        var ttGear = new ToolTip();
+        ttGear.SetToolTip(_btnSettingsGear, "Настройки, звук, стрелки и PGN");
+        _btnSettingsGear.Click += (s, e) =>
+        {
+            _menuSettings.Show(_btnSettingsGear, new Point(0, _btnSettingsGear.Height));
+        };
 
         _lblSidebarTitle = new Label
         {
-            Text = "⭐ Отчет о партии",
-            Font = new Font("Segoe UI", 11f, FontStyle.Bold),
+            Text = "Таблица ходов",
+            Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
             ForeColor = Color.White,
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleCenter
         };
 
         _sidebarHeader.Controls.Add(_lblSidebarTitle);
+        _sidebarHeader.Controls.Add(_btnShowOverview);
+        _sidebarHeader.Controls.Add(_btnQuickAnalyze);
         _sidebarHeader.Controls.Add(_btnBackToOverview);
+        _sidebarHeader.Controls.Add(_btnSettingsGear);
 
         // 2. Content Views Container
         var pnlContent = new Panel
@@ -570,20 +570,14 @@ public partial class Form1 : Form
             BackColor = ChessTheme.PanelDark
         };
 
-        // Build all 3 panels
         _pnlOverview = CreateOverviewPanel();
         _pnlMoveReview = CreateMoveReviewPanel();
-        _pnlSettings = CreateSettingsPanel();
 
         pnlContent.Controls.Add(_pnlOverview);
         pnlContent.Controls.Add(_pnlMoveReview);
-        pnlContent.Controls.Add(_pnlSettings);
 
         sidebar.Controls.Add(pnlContent);
         sidebar.Controls.Add(_sidebarHeader);
-
-        // Show overview initially
-        SwitchSidebarView("overview");
 
         return sidebar;
     }
@@ -592,30 +586,93 @@ public partial class Form1 : Form
     {
         _pnlOverview.Visible = (viewName == "overview");
         _pnlMoveReview.Visible = (viewName == "review");
-        _pnlSettings.Visible = (viewName == "settings");
 
         if (viewName == "overview")
         {
             _lblSidebarTitle.Text = "⭐ Отчет о партии";
-            _btnBackToOverview.Visible = false;
+            _btnBackToOverview.Visible = true;
+            _btnQuickAnalyze.Visible = false;
+            _btnShowOverview.Visible = false;
             _pnlOverview.BringToFront();
         }
-        else if (viewName == "review")
+        else
         {
-            _lblSidebarTitle.Text = "🔍 Обзор ходов";
-            _btnBackToOverview.Visible = true;
+            _lblSidebarTitle.Text = "Таблица ходов";
+            _btnBackToOverview.Visible = false;
+            _btnQuickAnalyze.Visible = true;
+            _btnShowOverview.Visible = true;
             _pnlMoveReview.BringToFront();
         }
-        else if (viewName == "settings")
+    }
+
+    private ContextMenuStrip CreateSettingsMenu()
+    {
+        var menu = new ContextMenuStrip
         {
-            _lblSidebarTitle.Text = "⚙ PGN и Настройки";
-            _btnBackToOverview.Visible = true;
-            _pnlSettings.BringToFront();
+            BackColor = ChessTheme.PanelDarker,
+            ForeColor = ChessTheme.TextPrimary,
+            ShowImageMargin = false,
+            Font = new Font("Segoe UI", 9.5f)
+        };
+
+        var mCopyPgn = new ToolStripMenuItem("📋  Скопировать PGN");
+        mCopyPgn.Click += (s, e) => CopyPgnToClipboard();
+
+        var mFlip = new ToolStripMenuItem("🔄  Перевернуть доску");
+        mFlip.Click += (s, e) => ToggleBoardFlip();
+
+        var mArrows = new ToolStripMenuItem("↗️  Стрелки подсказок") { CheckOnClick = true, Checked = true };
+        mArrows.CheckedChanged += (s, e) =>
+        {
+            _boardControl.ShowArrows = mArrows.Checked;
+            _boardControl.Invalidate();
+        };
+
+        var mSound = new ToolStripMenuItem("🔊  Звук ходов") { CheckOnClick = true, Checked = true };
+        mSound.CheckedChanged += (s, e) =>
+        {
+            SoundService.ToggleMute();
+            mSound.Checked = !SoundService.Muted;
+        };
+
+        var mDepth = new ToolStripMenuItem("📊  Глубина анализа Stockfish");
+        int[] depths = [10, 12, 14, 16, 18, 20];
+        foreach (int d in depths)
+        {
+            var item = new ToolStripMenuItem($"Глубина {d}" + (d == _analysisDepth ? " (текущая)" : ""))
+            {
+                Checked = (d == _analysisDepth)
+            };
+            int sel = d;
+            item.Click += (s, e) =>
+            {
+                _analysisDepth = sel;
+                foreach (ToolStripMenuItem mi in mDepth.DropDownItems)
+                {
+                    mi.Checked = false;
+                }
+                item.Checked = true;
+            };
+            mDepth.DropDownItems.Add(item);
         }
+
+        var mBrowse = new ToolStripMenuItem("⚙  Указать файл stockfish.exe...");
+        mBrowse.Click += (s, e) => BrowseEngineFile();
+
+        menu.Items.Add(mCopyPgn);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(mFlip);
+        menu.Items.Add(mArrows);
+        menu.Items.Add(mSound);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(mDepth);
+        menu.Items.Add(mBrowse);
+
+        return menu;
     }
     #endregion
 
-    #region View 1: Overview Panel (Screenshot 1 & 4 Match)
+    #region View 1: Overview Panel (Report)
     private Panel CreateOverviewPanel()
     {
         var pnl = new Panel
@@ -624,20 +681,6 @@ public partial class Form1 : Form
             BackColor = ChessTheme.PanelDark
         };
 
-        // 1. Top Mini Graph
-        _graphControl = new GameGraphControl
-        {
-            Dock = DockStyle.Top,
-            Height = 72,
-            BackColor = ChessTheme.PanelDarker
-        };
-        _graphControl.PlySelected += ply =>
-        {
-            GoToPly(ply);
-            SwitchSidebarView("review");
-        };
-
-        // 2. Scrollable Body
         var scrollBody = new Panel
         {
             Dock = DockStyle.Fill,
@@ -655,7 +698,6 @@ public partial class Form1 : Form
             Padding = new Padding(0, 4, 0, 8)
         };
 
-        // Player Labels Row
         var lblRowPlayers = new Label
         {
             Text = "Шахматисты",
@@ -689,7 +731,6 @@ public partial class Form1 : Form
         pnlPlayers.Controls.Add(_lblOverviewWhitePlayer);
         pnlPlayers.Controls.Add(_lblOverviewBlackPlayer);
 
-        // Accuracy Row
         var lblAccuracyTitle = new Label
         {
             Text = "Точность",
@@ -711,11 +752,10 @@ public partial class Form1 : Form
         pnlPlayers.Controls.Add(whiteAccCard);
         pnlPlayers.Controls.Add(blackAccCard);
 
-        // Divider
         var div1 = CreateDividerLine();
         div1.Dock = DockStyle.Top;
 
-        // Badge Comparison Table (10 categories, Forced removed)
+        // Badge Comparison Table (10 categories)
         _tableBadges = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
@@ -725,14 +765,13 @@ public partial class Form1 : Form
             BackColor = ChessTheme.PanelDark,
             Padding = new Padding(0, 4, 0, 4)
         };
-        _tableBadges.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42f)); // Name
-        _tableBadges.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 18f)); // White count
-        _tableBadges.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 22f)); // Center PNG icon
-        _tableBadges.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 18f)); // Black count
+        _tableBadges.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42f));
+        _tableBadges.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 18f));
+        _tableBadges.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 22f));
+        _tableBadges.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 18f));
 
         BuildBadgeTableRows();
 
-        // Divider
         var div2 = CreateDividerLine();
         div2.Dock = DockStyle.Top;
 
@@ -766,7 +805,7 @@ public partial class Form1 : Form
         pnlElo.Controls.Add(whiteEloCard);
         pnlElo.Controls.Add(blackEloCard);
 
-        // Bottom Big Green Button ("Смотреть отчет")
+        // Bottom Green Button ("Смотреть ходы")
         var pnlBottomBtn = new Panel
         {
             Dock = DockStyle.Bottom,
@@ -777,13 +816,13 @@ public partial class Form1 : Form
 
         _btnStartReview = new RoundedButton
         {
-            Text = "Смотреть отчет",
+            Text = "Смотреть ходы партии",
             Dock = DockStyle.Fill,
             BorderRadius = 8,
             NormalColor = ChessTheme.AccentGreen,
             HoverColor = ChessTheme.AccentGreenHover,
             PressedColor = Color.FromArgb(100, 150, 55),
-            Font = new Font("Segoe UI", 11.5f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 11f, FontStyle.Bold),
             ForeColor = Color.White
         };
         _btnStartReview.Click += (s, e) =>
@@ -801,7 +840,6 @@ public partial class Form1 : Form
 
         pnl.Controls.Add(scrollBody);
         pnl.Controls.Add(pnlBottomBtn);
-        pnl.Controls.Add(_graphControl);
 
         return pnl;
     }
@@ -837,7 +875,6 @@ public partial class Form1 : Form
     {
         _tableBadges.Controls.Clear();
 
-        // 10 move categories (Forced excluded per user request):
         MoveClassification[] order =
         {
             MoveClassification.Brilliant,
@@ -857,7 +894,6 @@ public partial class Form1 : Form
         {
             _tableBadges.RowStyles.Add(new RowStyle(SizeType.Absolute, 34f));
 
-            // Col 0: Title
             string title = c switch
             {
                 MoveClassification.Good => "Хороший",
@@ -874,7 +910,6 @@ public partial class Form1 : Form
                 TextAlign = ContentAlignment.MiddleLeft
             };
 
-            // Col 1: White count
             var lblW = new Label
             {
                 Text = "0",
@@ -885,7 +920,6 @@ public partial class Form1 : Form
                 Name = $"badge_w_{c}"
             };
 
-            // Col 2: Center Badge PNG (32x32)
             var picBadge = new PictureBox
             {
                 Size = new Size(32, 32),
@@ -895,7 +929,6 @@ public partial class Form1 : Form
                 Image = ResourceManager.GetBadgeImage(c)
             };
 
-            // Col 3: Black count
             var lblB = new Label
             {
                 Text = "0",
@@ -916,7 +949,7 @@ public partial class Form1 : Form
     }
     #endregion
 
-    #region View 2: Move-by-Move Review Panel (Screenshot 2 Match)
+    #region View 2: Move-by-Move Review Panel (Full Moves Table + Large Nav)
     private Panel CreateMoveReviewPanel()
     {
         var pnl = new Panel
@@ -925,49 +958,7 @@ public partial class Form1 : Form
             BackColor = ChessTheme.PanelDark
         };
 
-        // 1. Coach Speech Bubble Card at Top (Full-width clean card)
-        _coachBubbleCard = CreateCoachSpeechBubble();
-        _coachBubbleCard.Dock = DockStyle.Top;
-
-        // 2. Navigation Action Buttons under Coach ("Лучший ход", "Далее >")
-        var pnlCoachNav = new Panel
-        {
-            Dock = DockStyle.Top,
-            Height = 40,
-            BackColor = ChessTheme.PanelDark,
-            Padding = new Padding(12, 4, 12, 4)
-        };
-
-        _btnReviewBestMove = new RoundedButton
-        {
-            Text = "Лучший ход",
-            Width = 120,
-            Height = 32,
-            BorderRadius = 6,
-            NormalColor = Color.FromArgb(48, 46, 43),
-            HoverColor = Color.FromArgb(62, 60, 56),
-            Dock = DockStyle.Left,
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold)
-        };
-        _btnReviewBestMove.Click += (s, e) => ShowBestMoveHint();
-
-        _btnReviewNext = new RoundedButton
-        {
-            Text = "Далее >",
-            Width = 110,
-            Height = 32,
-            BorderRadius = 6,
-            NormalColor = Color.FromArgb(48, 46, 43),
-            HoverColor = Color.FromArgb(62, 60, 56),
-            Dock = DockStyle.Right,
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold)
-        };
-        _btnReviewNext.Click += (s, e) => GoToPly(_currentPlyIndex + 1);
-
-        pnlCoachNav.Controls.Add(_btnReviewBestMove);
-        pnlCoachNav.Controls.Add(_btnReviewNext);
-
-        // Variation Banner with Return to Game button
+        // Variation Banner
         _pnlVariationBanner = new Panel
         {
             Dock = DockStyle.Top,
@@ -1003,7 +994,7 @@ public partial class Form1 : Form
         _pnlVariationBanner.Controls.Add(_lblVariationTitle);
         _pnlVariationBanner.Controls.Add(_btnExitVariation);
 
-        // 3. Move History DataGridView (Fills the center!)
+        // Move History Table (Fills ALL available space, 15-16 visible rows)
         _moveHistory = new MoveHistoryControl
         {
             Dock = DockStyle.Fill
@@ -1027,69 +1018,20 @@ public partial class Form1 : Form
             }
         };
 
-        // 4. Bottom Playback Controls Bar
+        // Bottom Playback Controls Bar (Phase 7: Enlarged 70px x 48px buttons)
         var pnlPlayback = new Panel
         {
             Dock = DockStyle.Bottom,
-            Height = 44,
+            Height = 62,
             BackColor = ChessTheme.PanelDarker,
-            Padding = new Padding(6, 6, 6, 6)
+            Padding = new Padding(10, 7, 10, 7)
         };
 
-        _btnFirst = CreateNavButton("|<", (s, e) => GoToPly(-1));
-        _btnPrev = CreateNavButton("<", (s, e) => GoToPly(_currentPlyIndex - 1));
-        _btnAutoPlay = CreateNavButton("▶", (s, e) => ToggleAutoPlay());
-        _btnNext = CreateNavButton(">", (s, e) => GoToPly(_currentPlyIndex + 1));
-        _btnLast = CreateNavButton(">|", (s, e) => GoToPly(_currentGame.Moves.Count - 1));
-
-        _btnFlipReview = new RoundedButton
-        {
-            Text = "⟲",
-            Width = 36,
-            Height = 32,
-            BorderRadius = 5,
-            NormalColor = Color.FromArgb(48, 46, 43),
-            HoverColor = Color.FromArgb(62, 60, 56),
-            Font = new Font("Segoe UI", 10f, FontStyle.Bold),
-            Margin = new Padding(6, 0, 2, 0)
-        };
-        _btnFlipReview.Click += (s, e) => ToggleBoardFlip();
-
-        _btnToggleArrows = new RoundedButton
-        {
-            Text = "Стрелки",
-            Width = 72,
-            Height = 32,
-            BorderRadius = 5,
-            NormalColor = Color.FromArgb(50, 65, 80),
-            HoverColor = Color.FromArgb(65, 82, 100),
-            Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
-            Margin = new Padding(2, 0, 2, 0)
-        };
-        _btnToggleArrows.Click += (s, e) =>
-        {
-            _boardControl.ShowArrows = !_boardControl.ShowArrows;
-            _boardControl.Invalidate();
-            _btnToggleArrows.NormalColor = _boardControl.ShowArrows ? Color.FromArgb(50, 65, 80) : Color.FromArgb(48, 46, 43);
-        };
-
-        _btnToggleSound = new RoundedButton
-        {
-            Text = "Звук",
-            Width = 56,
-            Height = 32,
-            BorderRadius = 5,
-            NormalColor = Color.FromArgb(48, 46, 43),
-            HoverColor = Color.FromArgb(62, 60, 56),
-            Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
-            Margin = new Padding(2, 0, 2, 0)
-        };
-        _btnToggleSound.Click += (s, e) =>
-        {
-            SoundService.ToggleMute();
-            _btnToggleSound.NormalColor = SoundService.Muted ? Color.FromArgb(70, 40, 40) : Color.FromArgb(48, 46, 43);
-            _btnToggleSound.Text = SoundService.Muted ? "Без зв." : "Звук";
-        };
+        _btnFirst = CreateNavButton("|<", (s, e) => GoToPly(-1), 70);
+        _btnPrev = CreateNavButton("<", (s, e) => GoToPly(_currentPlyIndex - 1), 70);
+        _btnAutoPlay = CreateNavButton("▶", (s, e) => ToggleAutoPlay(), 80);
+        _btnNext = CreateNavButton(">", (s, e) => GoToPly(_currentPlyIndex + 1), 70);
+        _btnLast = CreateNavButton(">|", (s, e) => GoToPly(_currentGame.Moves.Count - 1), 70);
 
         var flowNav = new FlowLayoutPanel
         {
@@ -1100,280 +1042,44 @@ public partial class Form1 : Form
         };
         flowNav.Controls.AddRange(new Control[]
         {
-            _btnFirst, _btnPrev, _btnAutoPlay, _btnNext, _btnLast,
-            _btnFlipReview, _btnToggleArrows, _btnToggleSound
+            _btnFirst, _btnPrev, _btnAutoPlay, _btnNext, _btnLast
         });
+
+        // Center the buttons in the playback bar
+        pnlPlayback.Resize += (s, e) =>
+        {
+            int totalBtnW = (70 * 4) + 80 + (8 * 4);
+            int pad = Math.Max(0, (pnlPlayback.Width - totalBtnW) / 2);
+            flowNav.Padding = new Padding(pad, 0, 0, 0);
+        };
+
         pnlPlayback.Controls.Add(flowNav);
 
-        // 5. Mini Advantage Chart at Bottom of Review
-        _miniGraphControl = new GameGraphControl
-        {
-            Dock = DockStyle.Bottom,
-            Height = 56,
-            BackColor = ChessTheme.PanelDarker
-        };
-        _miniGraphControl.PlySelected += ply => GoToPly(ply);
-
-        pnl.Controls.Add(_coachBubbleCard);
-        pnl.Controls.Add(pnlCoachNav);
         pnl.Controls.Add(_pnlVariationBanner);
         pnl.Controls.Add(pnlPlayback);
-        pnl.Controls.Add(_miniGraphControl);
         pnl.Controls.Add(_moveHistory);
         _moveHistory.BringToFront();
 
         return pnl;
     }
 
-    private Panel CreateCoachSpeechBubble()
-    {
-        var card = new Panel
-        {
-            Height = 92,
-            BackColor = ChessTheme.PanelDark,
-            Padding = new Padding(10, 6, 10, 6)
-        };
-
-        // White Speech Bubble (Spans full width cleanly without coach face avatar)
-        var bubble = new Panel
-        {
-            Dock = DockStyle.Fill,
-            BackColor = Color.White
-        };
-        bubble.Paint += (s, e) =>
-        {
-            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            using var path = CreateRoundedPath(new Rectangle(0, 0, bubble.Width - 1, bubble.Height - 1), 8);
-            using var bg = new SolidBrush(Color.White);
-            using var pen = new Pen(Color.FromArgb(220, 222, 225), 1.2f);
-            e.Graphics.FillPath(bg, path);
-            e.Graphics.DrawPath(pen, path);
-        };
-
-        // Inside bubble:
-        _picBubbleBadge = new PictureBox
-        {
-            Size = new Size(24, 24),
-            Location = new Point(10, 8),
-            SizeMode = PictureBoxSizeMode.Zoom,
-            BackColor = Color.Transparent
-        };
-
-        _lblBubbleMoveTitle = new Label
-        {
-            Text = "Начальная позиция",
-            Font = new Font("Segoe UI", 10f, FontStyle.Bold),
-            ForeColor = Color.FromArgb(33, 32, 29),
-            Location = new Point(38, 9),
-            Size = new Size(240, 20),
-            BackColor = Color.Transparent
-        };
-
-        // Eval Pill (Right edge)
-        var pnlEvalPill = new Panel
-        {
-            Size = new Size(65, 24),
-            Location = new Point(bubble.Width - 75, 8),
-            BackColor = Color.FromArgb(33, 32, 29)
-        };
-        pnlEvalPill.Paint += (s, e) =>
-        {
-            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            using var path = CreateRoundedPath(new Rectangle(0, 0, pnlEvalPill.Width - 1, pnlEvalPill.Height - 1), 5);
-            using var bg = new SolidBrush(Color.FromArgb(33, 32, 29));
-            e.Graphics.FillPath(bg, path);
-        };
-
-        _lblBubbleEvalPill = new Label
-        {
-            Text = "0.00",
-            Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
-            ForeColor = Color.White,
-            Dock = DockStyle.Fill,
-            TextAlign = ContentAlignment.MiddleCenter,
-            BackColor = Color.Transparent
-        };
-        pnlEvalPill.Controls.Add(_lblBubbleEvalPill);
-
-        _lblBubbleComment = new Label
-        {
-            Text = "Нажмите «Начать анализ» для подробного разбора ходов с рекомендациями тренера.",
-            Font = new Font("Segoe UI", 8.5f),
-            ForeColor = Color.FromArgb(55, 60, 68),
-            Location = new Point(10, 34),
-            Size = new Size(bubble.Width - 20, 42),
-            BackColor = Color.Transparent
-        };
-
-        bubble.Resize += (s, e) =>
-        {
-            pnlEvalPill.Location = new Point(bubble.Width - 75, 8);
-            _lblBubbleComment.Size = new Size(Math.Max(50, bubble.Width - 20), 42);
-        };
-
-        bubble.Controls.Add(pnlEvalPill);
-        bubble.Controls.Add(_lblBubbleComment);
-        bubble.Controls.Add(_lblBubbleMoveTitle);
-        bubble.Controls.Add(_picBubbleBadge);
-
-        card.Controls.Add(bubble);
-        return card;
-    }
-
-    private RoundedButton CreateNavButton(string text, EventHandler onClick)
+    private static RoundedButton CreateNavButton(string text, EventHandler onClick, int width)
     {
         var btn = new RoundedButton
         {
             Text = text,
-            Width = 46,
-            Height = 32,
-            BorderRadius = 5,
+            Width = width,
+            Height = 48,
+            BorderRadius = 10,
             NormalColor = Color.FromArgb(48, 46, 43),
             HoverColor = Color.FromArgb(64, 62, 58),
-            Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+            PressedColor = Color.FromArgb(80, 78, 72),
+            Font = new Font("Segoe UI", 13.5f, FontStyle.Bold),
             ForeColor = Color.White,
-            Margin = new Padding(2, 0, 2, 0)
+            Margin = new Padding(4, 0, 4, 0)
         };
         btn.Click += onClick;
         return btn;
-    }
-    #endregion
-
-    #region View 3: Settings & PGN Panel
-    private Panel CreateSettingsPanel()
-    {
-        var pnl = new Panel
-        {
-            Dock = DockStyle.Fill,
-            Padding = new Padding(14),
-            AutoScroll = true,
-            BackColor = ChessTheme.PanelDark
-        };
-
-        var lblPgn = new Label
-        {
-            Text = "Текст партии (PGN):",
-            Dock = DockStyle.Top,
-            Height = 24,
-            ForeColor = ChessTheme.TextSecondary,
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold)
-        };
-
-        _txtPgnInput = new TextBox
-        {
-            Dock = DockStyle.Top,
-            Height = 170,
-            Multiline = true,
-            ScrollBars = ScrollBars.Vertical,
-            BackColor = ChessTheme.PanelDarker,
-            ForeColor = ChessTheme.TextPrimary,
-            BorderStyle = BorderStyle.FixedSingle,
-            Font = new Font("Consolas", 9f)
-        };
-
-        var btnLoadPgn = new RoundedButton
-        {
-            Text = "✔ Применить введенный PGN",
-            Dock = DockStyle.Top,
-            Height = 36,
-            BorderRadius = 6,
-            NormalColor = ChessTheme.AccentGreen,
-            HoverColor = ChessTheme.AccentGreenHover,
-            Margin = new Padding(0, 8, 0, 14)
-        };
-        btnLoadPgn.Click += (s, e) => LoadPgnFromText(_txtPgnInput.Text);
-
-        var btnOpenFile = new RoundedButton
-        {
-            Text = "📂 Открыть .pgn файл с диска",
-            Dock = DockStyle.Top,
-            Height = 36,
-            BorderRadius = 6,
-            NormalColor = Color.FromArgb(48, 46, 43),
-            HoverColor = Color.FromArgb(62, 60, 56),
-            Margin = new Padding(0, 4, 0, 16)
-        };
-        btnOpenFile.Click += (s, e) => OpenPgnFileDialog();
-
-        // Engine Path
-        var lblEngine = new Label
-        {
-            Text = "Путь к исполняемому файлу Stockfish:",
-            Dock = DockStyle.Top,
-            Height = 26,
-            ForeColor = ChessTheme.TextSecondary,
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold)
-        };
-
-        _txtEnginePath = new TextBox
-        {
-            Dock = DockStyle.Top,
-            Height = 26,
-            BackColor = ChessTheme.PanelDarker,
-            ForeColor = ChessTheme.TextPrimary,
-            BorderStyle = BorderStyle.FixedSingle
-        };
-
-        var btnBrowseEngine = new RoundedButton
-        {
-            Text = "Указать другой файл Stockfish...",
-            Dock = DockStyle.Top,
-            Height = 32,
-            BorderRadius = 5,
-            NormalColor = Color.FromArgb(48, 46, 43),
-            HoverColor = Color.FromArgb(62, 60, 56),
-            Margin = new Padding(0, 4, 0, 16)
-        };
-        btnBrowseEngine.Click += (s, e) => BrowseEngineFile();
-
-        // Depth & Threads
-        var lblDepth = new Label
-        {
-            Text = "Глубина анализа (Depth):",
-            Dock = DockStyle.Top,
-            Height = 24,
-            ForeColor = ChessTheme.TextSecondary
-        };
-        _numDepth = new NumericUpDown
-        {
-            Dock = DockStyle.Top,
-            Minimum = 8,
-            Maximum = 26,
-            Value = 14,
-            BackColor = ChessTheme.PanelDarker,
-            ForeColor = ChessTheme.TextPrimary
-        };
-
-        var lblThreads = new Label
-        {
-            Text = "Количество потоков (Threads):",
-            Dock = DockStyle.Top,
-            Height = 24,
-            ForeColor = ChessTheme.TextSecondary
-        };
-        _numThreads = new NumericUpDown
-        {
-            Dock = DockStyle.Top,
-            Minimum = 1,
-            Maximum = 64,
-            Value = 4,
-            BackColor = ChessTheme.PanelDarker,
-            ForeColor = ChessTheme.TextPrimary
-        };
-
-        pnl.Controls.Add(_numThreads);
-        pnl.Controls.Add(lblThreads);
-        pnl.Controls.Add(_numDepth);
-        pnl.Controls.Add(lblDepth);
-        pnl.Controls.Add(btnBrowseEngine);
-        pnl.Controls.Add(_txtEnginePath);
-        pnl.Controls.Add(lblEngine);
-        pnl.Controls.Add(btnOpenFile);
-        pnl.Controls.Add(btnLoadPgn);
-        pnl.Controls.Add(_txtPgnInput);
-        pnl.Controls.Add(lblPgn);
-
-        return pnl;
     }
     #endregion
 
@@ -1386,34 +1092,13 @@ public partial class Form1 : Form
             if (!string.IsNullOrEmpty(enginePath) && File.Exists(enginePath))
             {
                 _engine = new StockfishEngine(enginePath);
-                _txtEnginePath.Text = enginePath;
-                _lblEngineStatus.Text = $"● Stockfish 19";
                 _analysisService = new AnalysisService(_engine);
-            }
-            else
-            {
-                _lblEngineStatus.Text = "○ Stockfish не найден";
             }
         }
         catch (Exception ex)
         {
-            _lblEngineStatus.Text = "Ошибка: " + ex.Message;
+            MessageBox.Show("Ошибка инициализации Stockfish:\n" + ex.Message, "Stockfish Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
-    }
-
-    private void LoadSampleGame()
-    {
-        // Famous Opera Game
-        string operaGamePgn = @"[Event ""Paris""]
-[Site ""Paris FRA""]
-[Date ""1858.10.21""]
-[White ""Paul Morphy""]
-[Black ""Duke Karl / Count Isouard""]
-[Result ""1-0""]
-
-1. e4 e5 2. Nf3 d6 3. d4 Bg4 4. dxe5 Bxf3 5. Qxf3 dxe5 6. Bc4 Nf6 7. Qb3 Qe7 8. Nc3 c6 9. Bg5 b5 10. Nxb5 cxb5 11. Bxb5+ Nbd7 12. O-O-O Rd8 13. Rxd7 Rxd7 14. Rd1 Qe6 15. Bxd7+ Nxd7 16. Qb8+ Nxb8 17. Rd8# 1-0";
-
-        LoadPgnFromText(operaGamePgn);
     }
 
     public void LoadPgnFromText(string pgnText)
@@ -1435,10 +1120,19 @@ public partial class Form1 : Form
         _currentGame = game;
         _currentAnalysis = null;
         _currentPlyIndex = -1;
+        _rawPgnText = rawPgn ?? string.Empty;
 
-        if (rawPgn != null)
+        // Phase 5: Show Color Selection Dialog before loading
+        using (var dlg = new ColorSelectionDialog(game.White, game.WhiteElo, game.Black, game.BlackElo))
         {
-            _txtPgnInput.Text = rawPgn;
+            if (dlg.ShowDialog(this) == DialogResult.OK)
+            {
+                _userColor = dlg.SelectedColor;
+                bool shouldFlip = (_userColor == PieceColor.Black);
+                _boardControl.IsFlipped = shouldFlip;
+                _evalBar.IsFlipped = shouldFlip;
+                _moveHistory.UserFilterColor = _userColor;
+            }
         }
 
         // Update player bars
@@ -1493,10 +1187,12 @@ public partial class Form1 : Form
 
         _moveHistory.SetMoves(preliminaryMoves);
         _graphControl.Clear();
-        _miniGraphControl.Clear();
 
         GoToPly(-1);
-        SwitchSidebarView("overview");
+        SwitchSidebarView("review");
+
+        // Phase 5: Automatically launch analysis
+        _ = StartAnalysisAsync();
     }
 
     private void UpdatePlayerBarLabels(string whiteFull, string blackFull)
@@ -1613,18 +1309,11 @@ public partial class Form1 : Form
 
         if (plyIndex == -1)
         {
-            // Initial position before move 1
             var startBoard = new BoardState();
             _boardControl.SetPosition(startBoard, Square.None, Square.None, null, animate: false);
             _evalBar.Reset();
 
-            _lblBubbleMoveTitle.Text = "Начальная позиция";
-            _lblBubbleEvalPill.Text = "0.00";
-            _lblBubbleComment.Text = "Сделайте ход или используйте стрелки на клавиатуре / кнопки плеера.";
-            _picBubbleBadge.Image = null;
-
             _graphControl.SelectedPly = -1;
-            _miniGraphControl.SelectedPly = -1;
             UpdateCapturedPieces(startBoard);
             return;
         }
@@ -1665,27 +1354,12 @@ public partial class Form1 : Form
             badge = ma.Classification;
             _evalBar.SetEvaluation(ma.PostEval);
 
-            string moveSide = ma.Color == PieceColor.White ? "Белые" : "Черные";
-            _lblBubbleMoveTitle.Text = $"{ma.San} — {ma.Classification.GetTitle()} ({moveSide})";
-            _lblBubbleEvalPill.Text = ma.ScoreDisplay;
-            _lblBubbleComment.Text = ma.CoachComment;
-            _picBubbleBadge.Image = ResourceManager.GetBadgeImage(ma.Classification);
-
-            // Lichess-style arrows
             RestoreCurrentPlyArrows();
-        }
-        else
-        {
-            _lblBubbleMoveTitle.Text = $"{move.San} ({move.MoveNumber}.{(move.Color == PieceColor.White ? "Белые" : "Черные")})";
-            _lblBubbleEvalPill.Text = "0.00";
-            _lblBubbleComment.Text = "Запустите «Начать анализ» для оценки качества этого хода.";
-            _picBubbleBadge.Image = null;
         }
 
         _boardControl.SetPosition(board, move.Move.From, move.Move.To, badge, animate: true);
         _moveHistory.SelectPly(plyIndex);
         _graphControl.SelectedPly = plyIndex;
-        _miniGraphControl.SelectedPly = plyIndex;
         UpdateCapturedPieces(board);
     }
 
@@ -1697,7 +1371,6 @@ public partial class Form1 : Form
         var ma = _currentAnalysis.Moves[_currentPlyIndex];
         if (ma.Classification is MoveClassification.Blunder or MoveClassification.Mistake or MoveClassification.Inaccuracy or MoveClassification.MissedWin)
         {
-            // On mistakes and blunders, show opponent threat refutation arrow (red) in FenAfter
             if (ma.ThreatMove.HasValue && !ma.ThreatMove.Value.IsEmpty)
             {
                 _boardControl.AddArrow(ma.ThreatMove.Value.From, ma.ThreatMove.Value.To, Color.FromArgb(220, 231, 76, 60), width: 7f, hasOutline: true);
@@ -1705,24 +1378,9 @@ public partial class Form1 : Form
         }
         else if (ma.Classification is MoveClassification.Brilliant or MoveClassification.Great or MoveClassification.Best)
         {
-            // On great/best moves, show follow-up idea arrow (greenish)
             if (ma.ThreatMove.HasValue && !ma.ThreatMove.Value.IsEmpty)
             {
                 _boardControl.AddArrow(ma.ThreatMove.Value.From, ma.ThreatMove.Value.To, Color.FromArgb(200, 129, 182, 76), width: 6.5f, hasOutline: true);
-            }
-        }
-    }
-
-    private void ShowBestMoveHint()
-    {
-        if (_currentAnalysis != null && _currentPlyIndex >= 0 && _currentPlyIndex < _currentAnalysis.Moves.Count)
-        {
-            var ma = _currentAnalysis.Moves[_currentPlyIndex];
-            if (ma.BestMove.HasValue && !ma.BestMove.Value.IsEmpty)
-            {
-                _boardControl.ClearArrows();
-                _boardControl.AddArrow(ma.BestMove.Value.From, ma.BestMove.Value.To, Color.FromArgb(240, 52, 152, 219), width: 8f, hasOutline: true);
-                _lblBubbleComment.Text = $"Лучшим ходом было: {ma.BestMoveSan}. " + ma.CoachComment;
             }
         }
     }
@@ -1743,13 +1401,12 @@ public partial class Form1 : Form
             return;
         }
 
-        _btnAnalyze.Enabled = false;
-        _btnStop.Enabled = true;
+        _btnQuickAnalyze.Enabled = false;
         _progressBar.Visible = true;
         _progressBar.Value = 0;
 
         _analysisCts = new CancellationTokenSource();
-        int depth = (int)_numDepth.Value;
+        int depth = _analysisDepth;
 
         var progress = new Progress<AnalysisProgress>(p =>
         {
@@ -1757,7 +1414,6 @@ public partial class Form1 : Form
             if (p.LatestAnalyzedMove != null)
             {
                 _graphControl.AddMove(p.LatestAnalyzedMove);
-                _miniGraphControl.AddMove(p.LatestAnalyzedMove);
                 if (p.CurrentPly - 1 == _currentPlyIndex)
                 {
                     GoToPly(_currentPlyIndex);
@@ -1768,7 +1424,6 @@ public partial class Form1 : Form
         try
         {
             _graphControl.Clear();
-            _miniGraphControl.Clear();
 
             var analysis = await _analysisService.AnalyzeGameAsync(_currentGame, depth, progress, _analysisCts.Token);
             _currentAnalysis = analysis;
@@ -1781,16 +1436,14 @@ public partial class Form1 : Form
 
             _moveHistory.SetMoves(analysis.Moves);
             _graphControl.SetMoves(analysis.Moves);
-            _miniGraphControl.SetMoves(analysis.Moves);
 
             UpdateBadgeCountLabels(analysis);
 
-            SwitchSidebarView("overview");
             GoToPly(_currentPlyIndex >= 0 ? _currentPlyIndex : 0);
         }
         catch (OperationCanceledException)
         {
-            // Analysis stopped by user
+            // Stopped
         }
         catch (Exception ex)
         {
@@ -1798,8 +1451,7 @@ public partial class Form1 : Form
         }
         finally
         {
-            _btnAnalyze.Enabled = true;
-            _btnStop.Enabled = false;
+            _btnQuickAnalyze.Enabled = true;
             _progressBar.Visible = false;
             _analysisCts?.Dispose();
             _analysisCts = null;
@@ -1834,7 +1486,16 @@ public partial class Form1 : Form
     }
     #endregion
 
-    #region Dialogs & Event Handlers
+    #region Dialogs & Actions
+    private void OpenLoadPgnDialog()
+    {
+        using var dlg = new ImportPgnDialog(_rawPgnText);
+        if (dlg.ShowDialog(this) == DialogResult.OK && !string.IsNullOrWhiteSpace(dlg.PgnText))
+        {
+            LoadPgnFromText(dlg.PgnText);
+        }
+    }
+
     private void OpenDownloadUserDialog()
     {
         using var dlg = new DownloadGameDialog();
@@ -1844,24 +1505,16 @@ public partial class Form1 : Form
         }
     }
 
-    private void OpenPgnFileDialog()
+    private void CopyPgnToClipboard()
     {
-        using var ofd = new OpenFileDialog
+        if (!string.IsNullOrWhiteSpace(_rawPgnText))
         {
-            Filter = "PGN Files (*.pgn)|*.pgn|All Files (*.*)|*.*",
-            Title = "Выберите PGN-файл партии"
-        };
-        if (ofd.ShowDialog() == DialogResult.OK)
+            Clipboard.SetText(_rawPgnText);
+            MessageBox.Show("Текст партии (PGN) скопирован в буфер обмена.", "PGN скопирован", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        else
         {
-            try
-            {
-                string text = File.ReadAllText(ofd.FileName);
-                LoadPgnFromText(text);
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show("Не удалось прочитать файл:\n" + ex.Message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
+            MessageBox.Show("Партия ещё не загружена.", "Информация", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
     }
 
@@ -1872,13 +1525,12 @@ public partial class Form1 : Form
             Filter = "Executable Files (*.exe)|*.exe|All Files (*.*)|*.*",
             Title = "Укажите файл stockfish.exe"
         };
-        if (ofd.ShowDialog() == DialogResult.OK)
+        if (ofd.ShowDialog(this) == DialogResult.OK)
         {
-            _txtEnginePath.Text = ofd.FileName;
             _engine?.Dispose();
             _engine = new StockfishEngine(ofd.FileName);
-            _lblEngineStatus.Text = $"● Stockfish: {Path.GetFileName(ofd.FileName)}";
             _analysisService = new AnalysisService(_engine);
+            MessageBox.Show($"Движок успешно подключён:\n{Path.GetFileName(ofd.FileName)}", "Stockfish", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
     }
 
@@ -1923,7 +1575,6 @@ public partial class Form1 : Form
         var curBoard = _boardControl.Board;
         bool isCapture = !curBoard[move.To].IsEmpty || (move.To == curBoard.EnPassantSquare && curBoard[move.From].Type == PieceType.Pawn);
 
-        // Sound feedback
         if (isCapture)
         {
             SoundService.PlayCapture();
@@ -1943,33 +1594,26 @@ public partial class Form1 : Form
         _boardControl.SetPosition(newBoard, move.From, move.To, null);
         UpdateCapturedPieces(newBoard);
 
-        // Add to variation list and display in move history and banner
         _variationMoves.Add(san);
         _moveHistory.SetVariation(_currentPlyIndex, _variationMoves);
 
         _pnlVariationBanner.Visible = true;
         _lblVariationTitle.Text = $"Вариант: {string.Join(" ", _variationMoves)}";
 
-        // Cancel previous reactive analysis task
         _variationCts?.Cancel();
         _variationCts = new CancellationTokenSource();
         var ct = _variationCts.Token;
-
-        _lblBubbleMoveTitle.Text = $"Вариант: {san}";
-        _lblBubbleComment.Text = "Анализ хода Stockfish...";
 
         if (_engine == null || !_engine.IsRunning) return;
 
         try
         {
-            // Evaluate before and after to get move classification
             var preEval = await _engine.AnalyzePositionAsync(fenBefore, depth: null, nodes: 600000, ct: ct);
             if (ct.IsCancellationRequested) return;
 
             var postEval = await _engine.AnalyzePositionAsync(newBoard.ToFen(), depth: null, nodes: 600000, ct: ct);
             if (ct.IsCancellationRequested) return;
 
-            // Classify move against engine's lines
             bool isTop = string.Equals(uci, preEval.BestMoveUci, StringComparison.OrdinalIgnoreCase);
 
             double preWin = curBoard.SideToMove == PieceColor.White ? preEval.WinProbabilityWhite : (100.0 - preEval.WinProbabilityWhite);
@@ -1985,15 +1629,6 @@ public partial class Form1 : Form
             else classification = MoveClassification.Blunder;
 
             _evalBar.SetEvaluation(postEval);
-            _lblBubbleEvalPill.Text = postEval.ScoreDisplay;
-            _lblBubbleMoveTitle.Text = $"Вариант: {san} — {classification.GetTitle()}";
-            _picBubbleBadge.Image = ResourceManager.GetBadgeImage(classification);
-
-            string replySan = AnalysisService.ConvertUciToSan(newBoard.ToFen(), postEval.BestMoveUci);
-            _lblBubbleComment.Text = !string.IsNullOrEmpty(replySan)
-                ? $"Оценка: {postEval.ScoreDisplay}. Сильнейший ответ: {replySan} (глубина {postEval.Depth})"
-                : $"Оценка позиции: {postEval.ScoreDisplay}";
-
             _boardControl.SetPosition(newBoard, move.From, move.To, classification);
 
             _boardControl.ClearArrows();
@@ -2007,9 +1642,9 @@ public partial class Form1 : Form
             }
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex)
+        catch
         {
-            _lblBubbleComment.Text = "Ошибка анализа: " + ex.Message;
+            // Ignored
         }
     }
 
@@ -2031,11 +1666,6 @@ public partial class Form1 : Form
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
-        if (_txtPgnInput != null && _txtPgnInput.Focused)
-        {
-            return base.ProcessCmdKey(ref msg, keyData);
-        }
-
         switch (keyData)
         {
             case Keys.Left:

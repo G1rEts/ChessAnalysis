@@ -1,5 +1,6 @@
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Text;
 using ChessAnalysis.Core.Engine;
 using ChessAnalysis.UI.Resources;
 
@@ -25,11 +26,12 @@ public class EvalBarControl : Control
             true);
 
         BackColor = ChessTheme.BackgroundDark;
+        Width = 36;
 
         _animTimer = new System.Windows.Forms.Timer { Interval = 16 };
         _animTimer.Tick += (s, e) =>
         {
-            if (Math.Abs(_targetWhitePercent - _currentWhitePercent) > 0.4)
+            if (Math.Abs(_targetWhitePercent - _currentWhitePercent) > 0.3)
             {
                 _currentWhitePercent += (_targetWhitePercent - _currentWhitePercent) * 0.25;
                 Invalidate();
@@ -67,6 +69,7 @@ public class EvalBarControl : Control
     {
         var g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
 
         int w = Width - 2;
         int h = Height - 2;
@@ -82,18 +85,18 @@ public class EvalBarControl : Control
         Rectangle whiteRect, blackRect;
         if (!IsFlipped)
         {
-            // White at bottom
+            // Standard: Black at top, White at bottom
             blackRect = new Rectangle(barRect.X, barRect.Y, w, blackHeight);
             whiteRect = new Rectangle(barRect.X, barRect.Y + blackHeight, w, whiteHeight);
         }
         else
         {
-            // Black at bottom
+            // Flipped: White at top, Black at bottom
             whiteRect = new Rectangle(barRect.X, barRect.Y, w, whiteHeight);
             blackRect = new Rectangle(barRect.X, barRect.Y + whiteHeight, w, blackHeight);
         }
 
-        int radius = 4;
+        int radius = 5;
         using var clipPath = new GraphicsPath();
         clipPath.AddArc(barRect.X, barRect.Y, radius * 2, radius * 2, 180, 90);
         clipPath.AddArc(barRect.Right - radius * 2, barRect.Y, radius * 2, radius * 2, 270, 90);
@@ -104,8 +107,8 @@ public class EvalBarControl : Control
         var oldClip = g.Clip;
         g.SetClip(clipPath);
 
-        using var blackBrush = new SolidBrush(Color.FromArgb(33, 32, 29));
-        using var whiteBrush = new SolidBrush(Color.FromArgb(255, 255, 255));
+        using var blackBrush = new SolidBrush(Color.FromArgb(38, 36, 34));
+        using var whiteBrush = new SolidBrush(Color.FromArgb(245, 245, 245));
 
         g.FillRectangle(blackBrush, blackRect);
         g.FillRectangle(whiteBrush, whiteRect);
@@ -113,27 +116,31 @@ public class EvalBarControl : Control
         g.ResetClip();
 
         // Border
-        using var borderPen = new Pen(Color.FromArgb(70, 68, 65), 1.2f);
+        using var borderPen = new Pen(Color.FromArgb(75, 73, 70), 1.2f);
         g.DrawPath(borderPen, clipPath);
 
-        // Draw Evaluation Text
-        using var font = new Font("Segoe UI", 8f, FontStyle.Bold);
-        var sf = new StringFormat
+        // Draw Evaluation Text (9.5pt Bold, legible on the winning side)
+        using var font = new Font("Segoe UI", 9.5f, FontStyle.Bold);
+        using var sf = new StringFormat
         {
             Alignment = StringAlignment.Center,
             LineAlignment = StringAlignment.Center
         };
 
         bool whiteAdvantage = _currentWhitePercent >= 50.0;
-        Color textColor = whiteAdvantage ? Color.FromArgb(25, 24, 22) : Color.FromArgb(250, 250, 250);
+        Color textColor = whiteAdvantage ? Color.FromArgb(28, 27, 25) : Color.FromArgb(245, 245, 245);
         using var textBrush = new SolidBrush(textColor);
 
         int textY = whiteAdvantage
-            ? (!IsFlipped ? h - 22 : 4)
-            : (!IsFlipped ? 4 : h - 22);
+            ? (!IsFlipped ? h - 28 : 6)
+            : (!IsFlipped ? 6 : h - 28);
 
-        var textRect = new Rectangle(barRect.X, textY, w, 16);
-        string displayStr = _evalText.StartsWith("+") ? _evalText[1..] : _evalText;
+        var textRect = new Rectangle(barRect.X, textY, w, 22);
+        string displayStr = _evalText;
+        if (displayStr.StartsWith("+"))
+        {
+            displayStr = displayStr[1..];
+        }
         g.DrawString(displayStr, font, textBrush, textRect, sf);
     }
 

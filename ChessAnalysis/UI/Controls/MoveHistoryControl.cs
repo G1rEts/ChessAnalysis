@@ -119,6 +119,12 @@ public class MoveHistoryControl : UserControl
     private int TopOffset => BreadcrumbHeight + HeaderHeight;
     private int NumColWidth => 40;
 
+    public PieceColor? UserFilterColor { get; set; }
+
+    private bool ShouldShowCallout(MoveAnalysis m) =>
+        IsMistakeClassification(m.Classification) &&
+        (UserFilterColor == null || m.Color == UserFilterColor.Value);
+
     private void RebuildItems()
     {
         _items.Clear();
@@ -129,12 +135,12 @@ public class MoveHistoryControl : UserControl
         {
             var wMove = _moves[i];
             int moveNum = wMove.MoveNumber;
-            bool wIsBad = IsMistakeClassification(wMove.Classification);
+            bool wIsBad = ShouldShowCallout(wMove);
 
             if (wIsBad && i + 1 < moveCount && _moves[i + 1].Color == PieceColor.Black)
             {
                 var bMove = _moves[i + 1];
-                bool bIsBad = IsMistakeClassification(bMove.Classification);
+                bool bIsBad = ShouldShowCallout(bMove);
 
                 // Row 1: White move, Black has ellipsis "..."
                 var row1 = new MoveRowItem
@@ -195,7 +201,7 @@ public class MoveHistoryControl : UserControl
             else
             {
                 MoveAnalysis? bMove = (i + 1 < moveCount && _moves[i + 1].Color == PieceColor.Black) ? _moves[i + 1] : null;
-                bool bIsBad = bMove != null && IsMistakeClassification(bMove.Classification);
+                bool bIsBad = bMove != null && ShouldShowCallout(bMove);
 
                 var row = new MoveRowItem
                 {
