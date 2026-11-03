@@ -43,13 +43,13 @@ $$P(\text{win}) = \frac{100}{1 + 10^{-\frac{cp}{400}}} = \frac{100}{1 + e^{-0.00
 
 Для каждого сделанного в партии полухода рассчитывается падение шансов на победу относительно оценки позиции до хода:
 
-$$\Delta P = \max(0,\; P_{\text{до хода}} - P_{\text{после хода}})$$
+$$\Delta P = \max(0,\; P_{\text{before}} - P_{\text{after}})$$
 
 ### 3. Точность отдельного хода (Move Accuracy)
 
 Точность каждого хода определяется по экспоненциальной функции зависимости от $\Delta P$:
 
-$$\text{Accuracy} = \operatorname{clamp}\left(103.1668 \cdot e^{-0.04354 \cdot \Delta P} - 3.1669,\; 0.0,\; 100.0\right)$$
+$$\text{Accuracy} = \min\left(100.0,\; \max\left(0.0,\; 103.1668 \cdot e^{-0.04354 \cdot \Delta P} - 3.1669\right)\right)$$
 
 - Ход первой линии движка ($\Delta P = 0$): $100.0\%$
 - Незначительная помарка ($\Delta P \approx 5\%$): $\approx 80.0\%$
@@ -59,9 +59,9 @@ $$\text{Accuracy} = \operatorname{clamp}\left(103.1668 \cdot e^{-0.04354 \cdot \
 
 Итоговая точность игрока за партию вычисляется как среднее значение точности всех ходов за вычетом ходов дебютной книги, скорректированное штрафным коэффициентом за допущенные ошибки:
 
-$$\text{Penalty} = \frac{6.0 \cdot N_{\text{blunders}} + 3.0 \cdot N_{\text{mistakes}} + 0.8 \cdot N_{\text{inaccuracies}}}{N_{\text{evaluated\_moves}}} \times 20.0$$
+$$\text{Penalty} = \frac{6.0 \cdot N_{\text{blunders}} + 3.0 \cdot N_{\text{mistakes}} + 0.8 \cdot N_{\text{inaccuracies}}}{N_{\text{total}}} \times 20.0$$
 
-$$\text{Accuracy}_{\text{game}} = \operatorname{clamp}\left(\text{Accuracy}_{\text{base}} - \text{Penalty},\; 10.0,\; 99.8\right)$$
+$$\text{Accuracy}_{\text{game}} = \min\left(99.8,\; \max\left(10.0,\; \text{Accuracy}_{\text{base}} - \text{Penalty}\right)\right)$$
 
 Расчет перформанс-рейтинга (Performance Elo) калибруется по базовой сигмоиде точности с привязкой к рейтингу игрока и модификаторами за допущенные зевки, качество победы и наличие сильных ходов.
 

@@ -8,9 +8,10 @@ echo =======================================================
 echo.
 
 echo 1. Building Single-File Release (.EXE) [dist\ChessAnalysis_SingleFile]...
-dotnet publish ChessAnalysis\ChessAnalysis.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o dist\ChessAnalysis_SingleFile
+dotnet publish ChessAnalysis\ChessAnalysis.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -p:DebugType=none -o dist\ChessAnalysis_SingleFile
 if errorlevel 1 goto ERROR
 
+if exist "dist\ChessAnalysis_SingleFile\*.pdb" del /f /q "dist\ChessAnalysis_SingleFile\*.pdb"
 if exist "dist\ChessAnalysis_SingleFile\stockfish" rmdir /s /q "dist\ChessAnalysis_SingleFile\stockfish"
 
 echo.

@@ -599,6 +599,19 @@ public partial class Form1 : Form
                     UpdateVariationBoxUi();
                 }
 
+                // Prompt user for player color before generating report from live play
+                using (var dlg = new ColorSelectionDialog(_currentGame.White, _currentGame.WhiteElo, _currentGame.Black, _currentGame.BlackElo))
+                {
+                    if (dlg.ShowDialog(this) == DialogResult.OK)
+                    {
+                        _userColor = dlg.SelectedColor;
+                        bool shouldFlip = (_userColor == PieceColor.Black);
+                        _boardControl.IsFlipped = shouldFlip;
+                        _evalBar.IsFlipped = shouldFlip;
+                        _moveHistory.UserFilterColor = _userColor;
+                    }
+                }
+
                 _rawPgnText = _currentGame.ToPgn();
                 SwitchSidebarView("overview");
                 await StartAnalysisAsync();
@@ -2352,6 +2365,14 @@ public partial class Form1 : Form
         {
             badge = _currentAnalysis.Moves[plyIndex].Classification;
         }
+        else if (_currentAnalysis == null && plyIndex >= 0 && plyIndex < _moveHistory.Moves.Count)
+        {
+            var ma = _moveHistory.Moves[plyIndex];
+            if (ma.Classification != MoveClassification.Book || !string.IsNullOrEmpty(ma.ScoreDisplay))
+            {
+                badge = ma.Classification;
+            }
+        }
 
         // Sound feedback
         if (isAtEnd && !string.IsNullOrWhiteSpace(_currentGame.Result) && _currentGame.Result != "*")
@@ -2422,6 +2443,16 @@ public partial class Form1 : Form
         {
             _moveReviewCard.Visible = false;
             _moveReviewCard.Clear();
+
+            if (plyIndex >= 0 && plyIndex < _moveHistory.Moves.Count && _moveHistory.Moves[plyIndex].PostEval != null)
+            {
+                var cachedEval = _moveHistory.Moves[plyIndex].PostEval;
+                _currentFenEval = cachedEval;
+                _currentEvalFen = board.ToFen();
+                _evalBar.SetEvaluation(cachedEval);
+                _computerLines.SetLines(cachedEval, board);
+            }
+
             if (!_isAnalyzingGame && _engine != null && _engine.IsRunning)
             {
                 _variationCts?.Cancel();
@@ -2934,37 +2965,38 @@ public partial class Form1 : Form
             _currentFenEval = postEval;
             _currentEvalFen = fenAfter;
 
+            bool isTopMove = string.Equals(uci, preEval.BestMoveUci, StringComparison.OrdinalIgnoreCase);
+
+            double preWinWhite = preEval.WinProbabilityWhite;
+            double postWinWhite = postEval.WinProbabilityWhite;
+            PieceColor moveColor = boardBefore.SideToMove;
+            double deltaP = isTopMove
+                ? 0.0
+                : (moveColor == PieceColor.White
+                    ? Math.Max(0.0, preWinWhite - postWinWhite)
+                    : Math.Max(0.0, (100.0 - preWinWhite) - (100.0 - postWinWhite)));
+
+            int moveNum = (_currentPlyIndex >= 0 ? (_currentPlyIndex / 2) + 1 : 1) + (_activeVariationIndex / 2);
+            int? userRating = moveColor == PieceColor.White
+                ? (int.TryParse(_currentGame.WhiteElo, out int wr) ? wr : null)
+                : (int.TryParse(_currentGame.BlackElo, out int br) ? br : null);
+            var classification = AnalysisService.ClassifySingleMove(move, san, moveColor, moveNum, fenBefore, fenAfter, preEval, postEval, playerRating: userRating);
+            if (isTopMove && classification is MoveClassification.Blunder or MoveClassification.Mistake or MoveClassification.Inaccuracy)
+            {
+                classification = MoveClassification.Best;
+            }
+
+            _boardControl.LastMoveBadge = classification;
+            _boardControl.Invalidate();
+
             if (_currentAnalysis != null)
             {
-                bool isTopMove = string.Equals(uci, preEval.BestMoveUci, StringComparison.OrdinalIgnoreCase);
-
-                double preWinWhite = preEval.WinProbabilityWhite;
-                double postWinWhite = postEval.WinProbabilityWhite;
-                PieceColor moveColor = boardBefore.SideToMove;
-                double deltaP = isTopMove
-                    ? 0.0
-                    : (moveColor == PieceColor.White
-                        ? Math.Max(0.0, preWinWhite - postWinWhite)
-                        : Math.Max(0.0, (100.0 - preWinWhite) - (100.0 - postWinWhite)));
-
-                int moveNum = (_currentPlyIndex >= 0 ? (_currentPlyIndex / 2) + 1 : 1) + (_activeVariationIndex / 2);
-                int? userRating = moveColor == PieceColor.White
-                    ? (int.TryParse(_currentGame.WhiteElo, out int wr) ? wr : null)
-                    : (int.TryParse(_currentGame.BlackElo, out int br) ? br : null);
-                var classification = AnalysisService.ClassifySingleMove(move, san, moveColor, moveNum, fenBefore, fenAfter, preEval, postEval, playerRating: userRating);
-                if (isTopMove && classification is MoveClassification.Blunder or MoveClassification.Mistake or MoveClassification.Inaccuracy)
-                {
-                    classification = MoveClassification.Best;
-                }
-
                 if (_activeVariationIndex >= 0 && _activeVariationIndex < _activeVariation.Count)
                 {
                     _activeVariation[_activeVariationIndex].Classification = classification;
                     _activeVariation[_activeVariationIndex].PreEval = preEval;
                     _activeVariation[_activeVariationIndex].PostEval = postEval;
                 }
-
-                _boardControl.LastMoveBadge = classification;
 
                 string playedScore = FormatEvalPill(postEval.Centipawns, postEval.MateInMoves);
                 string bestScore = FormatEvalPill(preEval.Centipawns, preEval.MateInMoves);
@@ -2991,7 +3023,19 @@ public partial class Form1 : Form
             else
             {
                 _moveReviewCard.Visible = false;
-                _boardControl.LastMoveBadge = null;
+                if (_currentPlyIndex >= 0 && _currentPlyIndex < _moveHistory.Moves.Count)
+                {
+                    var existingMa = _moveHistory.Moves[_currentPlyIndex];
+                    existingMa.Classification = classification;
+                    existingMa.PreEval = preEval;
+                    existingMa.PostEval = postEval;
+                    existingMa.WinProbLoss = deltaP;
+                    existingMa.BestMoveUci = preEval.BestMoveUci;
+                    existingMa.BestMoveSan = !string.IsNullOrEmpty(preEval.BestMoveUci)
+                        ? AnalysisService.ConvertUciToSan(fenBefore, preEval.BestMoveUci)
+                        : "";
+                    _moveHistory.UpdateAnalyzedMove(existingMa);
+                }
             }
 
             _evalBar.SetEvaluation(postEval);
