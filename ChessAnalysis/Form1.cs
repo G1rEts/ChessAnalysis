@@ -2,6 +2,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using ChessAnalysis.Core.Analysis;
 using ChessAnalysis.Core.Chess;
+using ChessAnalysis.Core.Config;
 using ChessAnalysis.Core.Engine;
 using ChessAnalysis.UI.Controls;
 using ChessAnalysis.UI.Forms;
@@ -11,6 +12,8 @@ namespace ChessAnalysis;
 
 public partial class Form1 : Form
 {
+    private readonly string? _initialEnginePath;
+    private AppSettings _settings;
     private StockfishEngine? _engine;
     private AnalysisService? _analysisService;
     private CancellationTokenSource? _analysisCts;
@@ -20,7 +23,8 @@ public partial class Form1 : Form
     private int _currentPlyIndex = -1;
     private PieceColor _userColor = PieceColor.White;
     private string _rawPgnText = string.Empty;
-    private int _analysisDepth = 14;
+    private int _analysisDepth = 12;
+    private long _analysisNodes = 400_000;
 
     // --- UI Controls ---
     // Left/Center Viewport (Board + Players + EvalBar)
@@ -42,18 +46,19 @@ public partial class Form1 : Form
 
     // Top Header Bar
     private Label _lblLogoTitle = null!;
-    private Label _lblGameTitle = null!;
     private RoundedButton _btnLoadPgn = null!;
     private RoundedButton _btnDownloadUser = null!;
     private ProgressBar _progressBar = null!;
 
-    // Full-Width Evaluation Graph (Across Top)
+    // Evaluation Graph, Move Review Card, Real-time Computer Lines, Opening Bar
     private GameGraphControl _graphControl = null!;
+    private MoveReviewCardControl _moveReviewCard = null!;
+    private ComputerLinesControl _computerLines = null!;
+    private Panel _pnlOpeningBar = null!;
+    private Label _lblOpeningName = null!;
 
-    // Move Review Variation Banner
-    private Panel _pnlVariationBanner = null!;
-    private Label _lblVariationTitle = null!;
-    private RoundedButton _btnExitVariation = null!;
+    private bool _isAnalyzingGame = false;
+    private EngineEvaluation? _lastPositionEval;
 
     // Right Sidebar
     private Panel _sidebarContainer = null!;
@@ -61,9 +66,11 @@ public partial class Form1 : Form
     private Label _lblSidebarTitle = null!;
     private RoundedButton _btnBackToOverview = null!;
     private RoundedButton _btnShowOverview = null!;
-    private RoundedButton _btnQuickAnalyze = null!;
-    private RoundedButton _btnSettingsGear = null!;
     private ContextMenuStrip _menuSettings = null!;
+
+    // Arrow and Engine Options
+    private bool _showBestMoveArrow = true;
+    private bool _showThreatArrow = true;
 
     // View A: Overview Panel (Report)
     private Panel _pnlOverview = null!;
@@ -74,7 +81,31 @@ public partial class Form1 : Form
     private Label _lblWhiteElo = null!;
     private Label _lblBlackElo = null!;
     private TableLayoutPanel _tableBadges = null!;
+    private TableLayoutPanel _tablePhases = null!;
     private RoundedButton _btnStartReview = null!;
+
+    // Variation Box Control
+    private Panel _pnlVariationBox = null!;
+    private Label _lblVariationTitle = null!;
+    private FlowLayoutPanel _flowVariationMoves = null!;
+
+    // Phase Badges Controls
+    private PictureBox _picWhiteOpening = null!;
+    private Label _lblWhiteOpeningDash = null!;
+    private PictureBox _picBlackOpening = null!;
+    private Label _lblBlackOpeningDash = null!;
+
+    private PictureBox _picWhiteMiddlegame = null!;
+    private Label _lblWhiteMiddlegameDash = null!;
+    private PictureBox _picBlackMiddlegame = null!;
+    private Label _lblBlackMiddlegameDash = null!;
+
+    private PictureBox _picWhiteEndgame = null!;
+    private Label _lblWhiteEndgameDash = null!;
+    private PictureBox _picBlackEndgame = null!;
+    private Label _lblBlackEndgameDash = null!;
+
+    private readonly ToolTip _toolTip = new() { InitialDelay = 250, ReshowDelay = 100 };
 
     // View B: Move-by-Move Review Panel
     private Panel _pnlMoveReview = null!;
@@ -90,32 +121,53 @@ public partial class Form1 : Form
 
     // Reactive Variation Engine Analysis
     private CancellationTokenSource? _variationCts;
-    private readonly List<string> _variationMoves = new();
+    private readonly List<VariationStep> _activeVariation = new();
+    private int _activeVariationIndex = -1;
+    private int _variationBranchPly = -1;
+    private string? _lastBookOpeningName;
+    private EngineEvaluation? _currentFenEval;
+    private string _currentEvalFen = string.Empty;
 
-    public Form1()
+    private class VariationStep
     {
+        public Move Move { get; set; }
+        public string San { get; set; } = string.Empty;
+        public string FenBefore { get; set; } = string.Empty;
+        public string FenAfter { get; set; } = string.Empty;
+        public MoveClassification? Classification { get; set; }
+        public EngineEvaluation? PreEval { get; set; }
+        public EngineEvaluation? PostEval { get; set; }
+    }
+
+    public Form1(string? initialEnginePath = null)
+    {
+        _initialEnginePath = initialEnginePath;
+        _settings = AppSettings.Load();
         InitializeComponent();
         SetupCustomUi();
         SoundService.Initialize();
-        Task.Run(() => OpeningBook.Initialize());
+        OpeningBook.Initialize();
         InitializeEngine();
 
         // Start with clean empty board position
         _boardControl.Board = new BoardState();
         _evalBar.Reset();
-        _lblGameTitle.Text = "Загрузите партию";
         UpdatePlayerBarLabels("Белые", "Черные");
         _lblTopClock.Text = "";
         _lblBottomClock.Text = "";
+        SetOpeningName("Начальная позиция");
         SwitchSidebarView("review");
+
+        // Kick off Stockfish evaluation for the starting board position
+        TriggerStartupAnalysis();
     }
 
     private void SetupCustomUi()
     {
         Text = "Chess Analysis (Stockfish 19) — by Antigravity";
         Icon = ResourceManager.GetAppIcon();
-        Size = new Size(1360, 880);
-        MinimumSize = new Size(1100, 720);
+        Size = new Size(1320, 880);
+        MinimumSize = new Size(1000, 680);
         StartPosition = FormStartPosition.CenterScreen;
         BackColor = ChessTheme.BackgroundDark;
         ForeColor = ChessTheme.TextPrimary;
@@ -137,30 +189,17 @@ public partial class Form1 : Form
             }
         };
 
-        // 1. Top Bar Panel (Header with 2 action buttons)
+        // 1. Top Bar Panel (Header with branding and action buttons)
         var topBar = CreateTopBar();
 
-        // 2. Full-Width Evaluation Graph
-        _graphControl = new GameGraphControl
-        {
-            Dock = DockStyle.Top,
-            Height = 72,
-            BackColor = ChessTheme.PanelDarker
-        };
-        _graphControl.PlySelected += ply =>
-        {
-            GoToPly(ply);
-            SwitchSidebarView("review");
-        };
-
-        // 3. Main Area (Left = Board Viewport, Right = Sidebar)
+        // 2. Main Area (Left = Board Viewport, Right = Sidebar)
         var mainArea = new Panel
         {
             Dock = DockStyle.Fill,
             BackColor = ChessTheme.BackgroundDark
         };
 
-        // Right Sidebar (Width 490px per Phase 6)
+        // Right Sidebar (Width 515px)
         _sidebarContainer = CreateRightSidebar();
         _sidebarContainer.Dock = DockStyle.Right;
 
@@ -171,9 +210,8 @@ public partial class Form1 : Form
         mainArea.Controls.Add(boardViewport);
         mainArea.Controls.Add(_sidebarContainer);
 
-        // WinForms Dock Order: mainArea (Fill) -> graph (Top) -> topBar (Top)
+        // WinForms Dock Order: mainArea (Fill) -> topBar (Top)
         Controls.Add(mainArea);
-        Controls.Add(_graphControl);
         Controls.Add(topBar);
     }
 
@@ -194,30 +232,53 @@ public partial class Form1 : Form
             e.Graphics.DrawLine(borderPen, 0, topBar.Height - 1, topBar.Width, topBar.Height - 1);
         };
 
-        // Logo Title on Left
+        // Logo & Title Container on Left
+        var flowLogo = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Left,
+            AutoSize = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            BackColor = Color.Transparent,
+            Margin = new Padding(0)
+        };
+
         _lblLogoTitle = new Label
         {
             Text = "♔ ChessAnalysis",
             Font = new Font("Segoe UI", 12f, FontStyle.Bold),
             ForeColor = Color.White,
             AutoSize = true,
-            Dock = DockStyle.Left,
             TextAlign = ContentAlignment.MiddleLeft,
-            Cursor = Cursors.Hand
+            Cursor = Cursors.Hand,
+            Margin = new Padding(0, 3, 0, 0)
         };
-        _lblLogoTitle.Click += (s, e) => SwitchSidebarView("review");
+        _lblLogoTitle.Click += (s, e) => ResetToStartupScreen();
 
-        // Game Match / Opening Title
-        _lblGameTitle = new Label
+        var lblBrandPill = new Label
         {
-            Text = "Загрузите партию",
-            Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
-            ForeColor = Color.FromArgb(190, 190, 190),
+            Text = "by Antigravity",
+            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+            ForeColor = ChessTheme.AccentGreen,
             AutoSize = true,
-            Dock = DockStyle.Left,
             TextAlign = ContentAlignment.MiddleLeft,
-            Padding = new Padding(16, 0, 0, 0)
+            Cursor = Cursors.Hand,
+            Margin = new Padding(6, 6, 0, 0)
         };
+        lblBrandPill.Click += (s, e) => ResetToStartupScreen();
+
+        var lblSep = new Label
+        {
+            Text = "•",
+            Font = new Font("Segoe UI", 10f, FontStyle.Bold),
+            ForeColor = Color.FromArgb(120, 118, 115),
+            AutoSize = true,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Margin = new Padding(8, 4, 8, 0)
+        };
+
+        flowLogo.Controls.Add(_lblLogoTitle);
+        flowLogo.Controls.Add(lblBrandPill);
 
         // Action Buttons on Right
         var flowButtons = new FlowLayoutPanel
@@ -233,7 +294,7 @@ public partial class Form1 : Form
         _btnLoadPgn = new RoundedButton
         {
             Text = "Загрузить PGN",
-            Width = 140,
+            Width = 145,
             Height = 34,
             BorderRadius = 6,
             NormalColor = ChessTheme.AccentGreen,
@@ -248,7 +309,7 @@ public partial class Form1 : Form
         _btnDownloadUser = new RoundedButton
         {
             Text = "Поиск по нику",
-            Width = 140,
+            Width = 145,
             Height = 34,
             BorderRadius = 6,
             NormalColor = Color.FromArgb(48, 46, 43),
@@ -273,8 +334,7 @@ public partial class Form1 : Form
         };
 
         topBar.Controls.Add(flowButtons);
-        topBar.Controls.Add(_lblGameTitle);
-        topBar.Controls.Add(_lblLogoTitle);
+        topBar.Controls.Add(flowLogo);
         topBar.Controls.Add(_progressBar);
 
         return topBar;
@@ -319,7 +379,7 @@ public partial class Form1 : Form
 
     private void LayoutBoardViewport(Control viewport)
     {
-        int padX = 16;
+        int padX = 14;
         int padY = 8;
         int availW = viewport.ClientSize.Width - padX * 2;
         int availH = viewport.ClientSize.Height - padY * 2;
@@ -338,7 +398,10 @@ public partial class Form1 : Form
         int totalW = evalBarW + gap + boardSize;
         int totalH = playerBarH + verticalGap + boardSize + verticalGap + playerBarH;
 
-        int startX = padX + Math.Max(0, (availW - totalW) / 2);
+        // Shift board to the left by 1 board square per specification
+        int squareSize = boardSize / 8;
+        int flushRightX = viewport.ClientSize.Width - totalW - 14;
+        int startX = Math.Max(padX, flushRightX - squareSize);
         int startY = padY + Math.Max(0, (availH - totalH) / 2);
 
         int boardX = startX + evalBarW + gap;
@@ -385,26 +448,26 @@ public partial class Form1 : Form
             Text = isTop ? "Черные" : "Белые",
             Font = new Font("Segoe UI", 10f, FontStyle.Bold),
             ForeColor = Color.White,
-            AutoSize = true
+            AutoSize = false,
+            AutoEllipsis = true
         };
 
         var capturedCtrl = new CapturedPiecesControl
         {
-            Height = 24,
-            Width = 220
+            Height = 24
         };
 
         var clockPill = new Panel
         {
-            Size = new Size(76, 28),
+            Size = new Size(88, 32),
             BackColor = ChessTheme.PanelDarker
         };
         clockPill.Paint += (s, e) =>
         {
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             using var path = CreateRoundedPath(new Rectangle(0, 0, clockPill.Width - 1, clockPill.Height - 1), 6);
-            using var bg = new SolidBrush(ChessTheme.PanelDarker);
-            using var pen = new Pen(Color.FromArgb(70, 68, 65), 1.2f);
+            using var bg = new SolidBrush(Color.FromArgb(32, 30, 28));
+            using var pen = new Pen(Color.FromArgb(105, 102, 96), 1.8f);
             e.Graphics.FillPath(bg, path);
             e.Graphics.DrawPath(pen, path);
         };
@@ -412,8 +475,8 @@ public partial class Form1 : Form
         var lblClock = new Label
         {
             Text = "",
-            Font = new Font("Consolas", 10.5f, FontStyle.Bold),
-            ForeColor = Color.White,
+            Font = new Font("Consolas", 11.5f, FontStyle.Bold),
+            ForeColor = Color.FromArgb(245, 245, 245),
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleCenter,
             BackColor = Color.Transparent
@@ -428,9 +491,18 @@ public partial class Form1 : Form
         void LayoutBar()
         {
             avatar.Location = new Point(0, (bar.Height - avatar.Height) / 2);
-            lblPlayer.Location = new Point(36, (bar.Height - lblPlayer.Height) / 2);
-            capturedCtrl.Location = new Point(lblPlayer.Right + 8, (bar.Height - capturedCtrl.Height) / 2);
-            clockPill.Location = new Point(Math.Max(capturedCtrl.Right + 8, bar.Width - clockPill.Width), (bar.Height - clockPill.Height) / 2);
+            int clockW = 88;
+            int clockX = Math.Max(0, bar.Width - clockW);
+            clockPill.Location = new Point(clockX, (bar.Height - clockPill.Height) / 2);
+
+            using var g = bar.CreateGraphics();
+            var textSz = TextRenderer.MeasureText(g, lblPlayer.Text, lblPlayer.Font);
+            int nameW = Math.Min(180, Math.Max(40, textSz.Width + 4));
+            lblPlayer.SetBounds(36, (bar.Height - 22) / 2, nameW, 22);
+
+            int captX = 36 + nameW + 8;
+            int captW = Math.Max(10, clockX - captX - 8);
+            capturedCtrl.SetBounds(captX, (bar.Height - capturedCtrl.Height) / 2, captW, 24);
         }
 
         bar.Resize += (s, e) => LayoutBar();
@@ -460,7 +532,7 @@ public partial class Form1 : Form
     {
         var sidebar = new Panel
         {
-            Width = 490,
+            Width = 590,
             BackColor = ChessTheme.PanelDark
         };
 
@@ -485,67 +557,55 @@ public partial class Form1 : Form
         _btnBackToOverview = new RoundedButton
         {
             Text = "← К ходам",
-            Width = 86,
+            Width = 105,
             Height = 30,
             BorderRadius = 5,
             NormalColor = Color.FromArgb(48, 46, 43),
             HoverColor = Color.FromArgb(62, 60, 56),
-            Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
             Dock = DockStyle.Left,
             Visible = false
         };
         _btnBackToOverview.Click += (s, e) => SwitchSidebarView("review");
 
-        _btnQuickAnalyze = new RoundedButton
-        {
-            Text = "🔍",
-            Width = 32,
-            Height = 30,
-            BorderRadius = 6,
-            NormalColor = ChessTheme.AccentGreen,
-            HoverColor = ChessTheme.AccentGreenHover,
-            PressedColor = Color.FromArgb(100, 150, 55),
-            Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
-            ForeColor = Color.White,
-            Dock = DockStyle.Left,
-            Margin = new Padding(0, 0, 8, 0)
-        };
-        var ttAnalyze = new ToolTip();
-        ttAnalyze.SetToolTip(_btnQuickAnalyze, "Запустить анализ партии движком Stockfish");
-        _btnQuickAnalyze.Click += async (s, e) => await StartAnalysisAsync();
-
         _btnShowOverview = new RoundedButton
         {
             Text = "⭐ Отчет",
-            Width = 74,
+            Width = 96,
             Height = 30,
             BorderRadius = 5,
             NormalColor = Color.FromArgb(48, 46, 43),
             HoverColor = Color.FromArgb(62, 60, 56),
-            Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
             Dock = DockStyle.Left,
             Margin = new Padding(6, 0, 0, 0)
         };
-        _btnShowOverview.Click += (s, e) => SwitchSidebarView("overview");
+        _btnShowOverview.Click += async (s, e) =>
+        {
+            if (_isAnalyzingGame)
+            {
+                SwitchSidebarView("overview");
+                return;
+            }
 
-        _btnSettingsGear = new RoundedButton
-        {
-            Text = "⚙",
-            Width = 32,
-            Height = 30,
-            BorderRadius = 6,
-            NormalColor = Color.FromArgb(48, 46, 43),
-            HoverColor = Color.FromArgb(62, 60, 56),
-            PressedColor = Color.FromArgb(75, 73, 68),
-            Font = new Font("Segoe UI", 11.5f, FontStyle.Bold),
-            ForeColor = Color.White,
-            Dock = DockStyle.Right
-        };
-        var ttGear = new ToolTip();
-        ttGear.SetToolTip(_btnSettingsGear, "Настройки, звук, стрелки и PGN");
-        _btnSettingsGear.Click += (s, e) =>
-        {
-            _menuSettings.Show(_btnSettingsGear, new Point(0, _btnSettingsGear.Height));
+            if (_currentAnalysis == null && _currentGame.Moves.Count > 0)
+            {
+                if (_activeVariation.Count > 0)
+                {
+                    _activeVariation.Clear();
+                    _activeVariationIndex = -1;
+                    _variationBranchPly = -1;
+                    _moveHistory.ClearVariation();
+                    UpdateVariationBoxUi();
+                }
+
+                _rawPgnText = _currentGame.ToPgn();
+                SwitchSidebarView("overview");
+                await StartAnalysisAsync();
+                return;
+            }
+
+            SwitchSidebarView("overview");
         };
 
         _lblSidebarTitle = new Label
@@ -559,9 +619,7 @@ public partial class Form1 : Form
 
         _sidebarHeader.Controls.Add(_lblSidebarTitle);
         _sidebarHeader.Controls.Add(_btnShowOverview);
-        _sidebarHeader.Controls.Add(_btnQuickAnalyze);
         _sidebarHeader.Controls.Add(_btnBackToOverview);
-        _sidebarHeader.Controls.Add(_btnSettingsGear);
 
         // 2. Content Views Container
         var pnlContent = new Panel
@@ -591,7 +649,6 @@ public partial class Form1 : Form
         {
             _lblSidebarTitle.Text = "⭐ Отчет о партии";
             _btnBackToOverview.Visible = true;
-            _btnQuickAnalyze.Visible = false;
             _btnShowOverview.Visible = false;
             _pnlOverview.BringToFront();
         }
@@ -599,7 +656,6 @@ public partial class Form1 : Form
         {
             _lblSidebarTitle.Text = "Таблица ходов";
             _btnBackToOverview.Visible = false;
-            _btnQuickAnalyze.Visible = true;
             _btnShowOverview.Visible = true;
             _pnlMoveReview.BringToFront();
         }
@@ -615,18 +671,99 @@ public partial class Form1 : Form
             Font = new Font("Segoe UI", 9.5f)
         };
 
+        var mAnalyze = new ToolStripMenuItem("▶️  Запустить полный анализ партии");
+        mAnalyze.Click += async (s, e) => await StartAnalysisAsync();
+
         var mCopyPgn = new ToolStripMenuItem("📋  Скопировать PGN");
         mCopyPgn.Click += (s, e) => CopyPgnToClipboard();
 
         var mFlip = new ToolStripMenuItem("🔄  Перевернуть доску");
         mFlip.Click += (s, e) => ToggleBoardFlip();
 
-        var mArrows = new ToolStripMenuItem("↗️  Стрелки подсказок") { CheckOnClick = true, Checked = true };
-        mArrows.CheckedChanged += (s, e) =>
+        // MultiPV (1..5 computer lines)
+        var mMultiPv = new ToolStripMenuItem("📊  Линии анализа Stockfish");
+        var pvItems = new List<ToolStripMenuItem>();
+        for (int i = 1; i <= 5; i++)
         {
-            _boardControl.ShowArrows = mArrows.Checked;
-            _boardControl.Invalidate();
+            int lines = i;
+            var mi = new ToolStripMenuItem(i == 2 ? $"{i} линии (по умолчанию)" : (i == 1 ? "1 линия" : $"{i} линий"))
+            {
+                Checked = (i == _settings.MultiPv)
+            };
+            mi.Click += (s, e) =>
+            {
+                _settings.MultiPv = lines;
+                _settings.Save();
+                _computerLines.LineCount = lines;
+                _ = _engine?.SetMultiPvAsync(lines);
+                foreach (var it in pvItems) it.Checked = false;
+                mi.Checked = true;
+                if (_currentPlyIndex >= 0 && _currentGame.Moves.Count > 0 && _engine != null)
+                {
+                    var curFen = _currentPlyIndex < _currentGame.Moves.Count
+                        ? _currentGame.Moves[_currentPlyIndex].FenAfter
+                        : new BoardState().ToFen();
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var eval = await _engine.AnalyzePositionAsync(curFen, depth: _analysisDepth, nodes: 400_000);
+                            Invoke(() =>
+                            {
+                                var b = new BoardState();
+                                b.LoadFen(curFen);
+                                _computerLines.SetLines(eval, b);
+                            });
+                        }
+                        catch { }
+                    });
+                }
+            };
+            pvItems.Add(mi);
+            mMultiPv.DropDownItems.Add(mi);
+        }
+
+        // Threads (1..16 threads)
+        var mThreads = new ToolStripMenuItem("⚡  Потоки процессора (Threads)");
+        var thItems = new List<ToolStripMenuItem>();
+        int[] threadChoices = [1, 2, 4, 6, 8, 12, 16];
+        foreach (int th in threadChoices)
+        {
+            int tVal = th;
+            var mi = new ToolStripMenuItem($"{tVal} потока/потоков")
+            {
+                Checked = (tVal == _settings.Threads)
+            };
+            mi.Click += (s, e) =>
+            {
+                _settings.Threads = tVal;
+                _settings.Save();
+                _ = _engine?.SetThreadsAsync(tVal);
+                foreach (var it in thItems) it.Checked = false;
+                mi.Checked = true;
+            };
+            thItems.Add(mi);
+            mThreads.DropDownItems.Add(mi);
+        }
+
+        // Arrow options
+        var mArrowsMenu = new ToolStripMenuItem("↗️  Стрелки на доске");
+        var mArrowBest = new ToolStripMenuItem("🔵  Сильнейший ход (синяя стрелка)") { CheckOnClick = true, Checked = _showBestMoveArrow };
+        mArrowBest.CheckedChanged += (s, e) =>
+        {
+            _showBestMoveArrow = mArrowBest.Checked;
+            RestoreCurrentPlyArrows();
         };
+
+        var mArrowThreat = new ToolStripMenuItem("🔴  Угроза соперника при ошибке (красная стрелка)") { CheckOnClick = true, Checked = _showThreatArrow };
+        mArrowThreat.CheckedChanged += (s, e) =>
+        {
+            _showThreatArrow = mArrowThreat.Checked;
+            RestoreCurrentPlyArrows();
+        };
+
+        mArrowsMenu.DropDownItems.Add(mArrowBest);
+        mArrowsMenu.DropDownItems.Add(mArrowThreat);
 
         var mSound = new ToolStripMenuItem("🔊  Звук ходов") { CheckOnClick = true, Checked = true };
         mSound.CheckedChanged += (s, e) =>
@@ -635,37 +772,54 @@ public partial class Form1 : Form
             mSound.Checked = !SoundService.Muted;
         };
 
-        var mDepth = new ToolStripMenuItem("📊  Глубина анализа Stockfish");
-        int[] depths = [10, 12, 14, 16, 18, 20];
-        foreach (int d in depths)
+        var mSpeed = new ToolStripMenuItem("⚡  Сила и скорость Stockfish");
+        var mFast = new ToolStripMenuItem("⚡ Быстрый (~1 сек, 3270 elo) — По умолчанию") { Checked = true };
+        var mStandard = new ToolStripMenuItem("🧠 Стандартный (~5 сек, 3430 elo)");
+        var mDeep = new ToolStripMenuItem("🔬 Глубокий (~20 сек, 3500+ elo)");
+
+        mFast.Click += (s, e) =>
         {
-            var item = new ToolStripMenuItem($"Глубина {d}" + (d == _analysisDepth ? " (текущая)" : ""))
-            {
-                Checked = (d == _analysisDepth)
-            };
-            int sel = d;
-            item.Click += (s, e) =>
-            {
-                _analysisDepth = sel;
-                foreach (ToolStripMenuItem mi in mDepth.DropDownItems)
-                {
-                    mi.Checked = false;
-                }
-                item.Checked = true;
-            };
-            mDepth.DropDownItems.Add(item);
-        }
+            _analysisNodes = 1_000_000;
+            _analysisDepth = 18;
+            mFast.Checked = true;
+            mStandard.Checked = false;
+            mDeep.Checked = false;
+        };
+        mStandard.Click += (s, e) =>
+        {
+            _analysisNodes = 5_000_000;
+            _analysisDepth = 22;
+            mFast.Checked = false;
+            mStandard.Checked = true;
+            mDeep.Checked = false;
+        };
+        mDeep.Click += (s, e) =>
+        {
+            _analysisNodes = 15_000_000;
+            _analysisDepth = 26;
+            mFast.Checked = false;
+            mStandard.Checked = false;
+            mDeep.Checked = true;
+        };
+
+        mSpeed.DropDownItems.Add(mFast);
+        mSpeed.DropDownItems.Add(mStandard);
+        mSpeed.DropDownItems.Add(mDeep);
 
         var mBrowse = new ToolStripMenuItem("⚙  Указать файл stockfish.exe...");
         mBrowse.Click += (s, e) => BrowseEngineFile();
 
-        menu.Items.Add(mCopyPgn);
+        menu.Items.Add(mAnalyze);
         menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(mCopyPgn);
         menu.Items.Add(mFlip);
-        menu.Items.Add(mArrows);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(mMultiPv);
+        menu.Items.Add(mThreads);
+        menu.Items.Add(mArrowsMenu);
         menu.Items.Add(mSound);
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(mDepth);
+        menu.Items.Add(mSpeed);
         menu.Items.Add(mBrowse);
 
         return menu;
@@ -685,133 +839,120 @@ public partial class Form1 : Form
         {
             Dock = DockStyle.Fill,
             AutoScroll = true,
-            Padding = new Padding(14, 8, 14, 8),
+            AutoScrollMinSize = new Size(0, 640),
+            Padding = new Padding(14, 4, 14, 12),
             BackColor = ChessTheme.PanelDark
         };
 
-        // Players & Accuracy Section
-        var pnlPlayers = new Panel
+        // 1. Players & Accuracy Section (4-column TableLayoutPanel aligned with Badges & Phases)
+        var pnlPlayers = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
-            Height = 78,
+            Height = 72,
+            ColumnCount = 4,
+            RowCount = 2,
             BackColor = Color.Transparent,
-            Padding = new Padding(0, 4, 0, 8)
+            Padding = new Padding(0, 2, 0, 2)
         };
+        pnlPlayers.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 40f));
+        pnlPlayers.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 19f));
+        pnlPlayers.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 22f));
+        pnlPlayers.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 19f));
+
+        pnlPlayers.RowStyles.Add(new RowStyle(SizeType.Absolute, 24f));
+        pnlPlayers.RowStyles.Add(new RowStyle(SizeType.Absolute, 44f));
 
         var lblRowPlayers = new Label
         {
             Text = "Шахматисты",
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
             ForeColor = ChessTheme.TextSecondary,
-            Location = new Point(0, 4),
-            AutoSize = true
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Padding = new Padding(4, 0, 0, 0)
         };
 
         _lblOverviewWhitePlayer = new Label
         {
             Text = "Белые",
-            Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 10f, FontStyle.Bold),
             ForeColor = Color.White,
-            Location = new Point(145, 4),
-            Size = new Size(110, 20),
+            Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleCenter
         };
+
+        var spacerPlayers = new Label { Dock = DockStyle.Fill };
 
         _lblOverviewBlackPlayer = new Label
         {
             Text = "Черные",
-            Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 10f, FontStyle.Bold),
             ForeColor = Color.White,
-            Location = new Point(275, 4),
-            Size = new Size(110, 20),
+            Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleCenter
         };
 
-        pnlPlayers.Controls.Add(lblRowPlayers);
-        pnlPlayers.Controls.Add(_lblOverviewWhitePlayer);
-        pnlPlayers.Controls.Add(_lblOverviewBlackPlayer);
+        pnlPlayers.Controls.Add(lblRowPlayers, 0, 0);
+        pnlPlayers.Controls.Add(_lblOverviewWhitePlayer, 1, 0);
+        pnlPlayers.Controls.Add(spacerPlayers, 2, 0);
+        pnlPlayers.Controls.Add(_lblOverviewBlackPlayer, 3, 0);
 
         var lblAccuracyTitle = new Label
         {
             Text = "Точность",
-            Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
             ForeColor = Color.White,
-            Location = new Point(0, 36),
-            AutoSize = true
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Padding = new Padding(4, 0, 0, 0)
         };
 
-        var whiteAccCard = CreateWhiteScoreCard(out _lblWhiteAccuracy);
-        whiteAccCard.Location = new Point(155, 30);
-        whiteAccCard.Size = new Size(95, 38);
+        var whiteAccCard = CreatePlayerScoreCard(isWhitePlayer: true, out _lblWhiteAccuracy);
+        var spacerAcc = new Label { Dock = DockStyle.Fill };
+        var blackAccCard = CreatePlayerScoreCard(isWhitePlayer: false, out _lblBlackAccuracy);
 
-        var blackAccCard = CreateWhiteScoreCard(out _lblBlackAccuracy);
-        blackAccCard.Location = new Point(285, 30);
-        blackAccCard.Size = new Size(95, 38);
-
-        pnlPlayers.Controls.Add(lblAccuracyTitle);
-        pnlPlayers.Controls.Add(whiteAccCard);
-        pnlPlayers.Controls.Add(blackAccCard);
+        pnlPlayers.Controls.Add(lblAccuracyTitle, 0, 1);
+        pnlPlayers.Controls.Add(whiteAccCard, 1, 1);
+        pnlPlayers.Controls.Add(spacerAcc, 2, 1);
+        pnlPlayers.Controls.Add(blackAccCard, 3, 1);
 
         var div1 = CreateDividerLine();
         div1.Dock = DockStyle.Top;
 
-        // Badge Comparison Table (10 categories)
+        // 2. Badge Comparison Table (10 categories, height 380px, 38f per row with comfortable spacing)
         _tableBadges = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
-            Height = 340,
+            Height = 380,
             ColumnCount = 4,
             RowCount = 10,
             BackColor = ChessTheme.PanelDark,
-            Padding = new Padding(0, 4, 0, 4)
+            Padding = new Padding(0, 2, 0, 2)
         };
-        _tableBadges.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42f));
-        _tableBadges.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 18f));
+        _tableBadges.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 40f));
+        _tableBadges.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 19f));
         _tableBadges.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 22f));
-        _tableBadges.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 18f));
+        _tableBadges.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 19f));
 
         BuildBadgeTableRows();
 
-        var div2 = CreateDividerLine();
-        div2.Dock = DockStyle.Top;
+        // 3. Rating Section (aligned with badges)
+        var divElo = CreateDividerLine();
+        divElo.Dock = DockStyle.Top;
+        var pnlElo = CreateRatingPanel(out _lblWhiteElo, out _lblBlackElo);
 
-        // Estimated ELO Row
-        var pnlElo = new Panel
-        {
-            Dock = DockStyle.Top,
-            Height = 60,
-            BackColor = Color.Transparent,
-            Padding = new Padding(0, 8, 0, 8)
-        };
+        // 4. Phases Table (Always visible, aligned with columns)
+        var divPhases = CreateDividerLine();
+        divPhases.Dock = DockStyle.Top;
+        _tablePhases = CreatePhasesTable();
 
-        var lblEloTitle = new Label
-        {
-            Text = "Рейтинг",
-            Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
-            ForeColor = Color.White,
-            Location = new Point(0, 16),
-            AutoSize = true
-        };
-
-        var whiteEloCard = CreateWhiteScoreCard(out _lblWhiteElo);
-        whiteEloCard.Location = new Point(155, 10);
-        whiteEloCard.Size = new Size(95, 36);
-
-        var blackEloCard = CreateWhiteScoreCard(out _lblBlackElo);
-        blackEloCard.Location = new Point(285, 10);
-        blackEloCard.Size = new Size(95, 36);
-
-        pnlElo.Controls.Add(lblEloTitle);
-        pnlElo.Controls.Add(whiteEloCard);
-        pnlElo.Controls.Add(blackEloCard);
-
-        // Bottom Green Button ("Смотреть ходы")
+        // 5. Bottom Green Button ("Смотреть ходы")
         var pnlBottomBtn = new Panel
         {
             Dock = DockStyle.Bottom,
-            Height = 60,
+            Height = 52,
             BackColor = ChessTheme.PanelDark,
-            Padding = new Padding(14, 6, 14, 8)
+            Padding = new Padding(14, 4, 14, 6)
         };
 
         _btnStartReview = new RoundedButton
@@ -828,41 +969,245 @@ public partial class Form1 : Form
         _btnStartReview.Click += (s, e) =>
         {
             SwitchSidebarView("review");
-            GoToPly(_currentPlyIndex >= 0 ? _currentPlyIndex : 0);
+            GoToPly(_currentPlyIndex >= 0 ? _currentPlyIndex : 0, forceRefresh: true);
         };
         pnlBottomBtn.Controls.Add(_btnStartReview);
 
+        // WinForms Top Dock order: last added is on top
+        scrollBody.Controls.Add(_tablePhases);
+        scrollBody.Controls.Add(divPhases);
         scrollBody.Controls.Add(pnlElo);
-        scrollBody.Controls.Add(div2);
+        scrollBody.Controls.Add(divElo);
         scrollBody.Controls.Add(_tableBadges);
         scrollBody.Controls.Add(div1);
         scrollBody.Controls.Add(pnlPlayers);
 
         pnl.Controls.Add(scrollBody);
         pnl.Controls.Add(pnlBottomBtn);
+        pnlBottomBtn.BringToFront();
 
         return pnl;
     }
 
-    private Panel CreateWhiteScoreCard(out Label lblScore)
+    private TableLayoutPanel CreateRatingPanel(out Label lblWhiteElo, out Label lblBlackElo)
+    {
+        var pnl = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            Height = 48,
+            ColumnCount = 4,
+            RowCount = 1,
+            BackColor = Color.Transparent,
+            Padding = new Padding(0, 2, 0, 2)
+        };
+        pnl.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 40f));
+        pnl.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 19f));
+        pnl.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 22f));
+        pnl.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 19f));
+        pnl.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+
+        var lblEloTitle = new Label
+        {
+            Text = "Рейтинг",
+            Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
+            ForeColor = Color.White,
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Padding = new Padding(4, 0, 0, 0)
+        };
+
+        var whiteEloCard = CreatePlayerScoreCard(isWhitePlayer: true, out lblWhiteElo);
+        var spacer = new Label { Dock = DockStyle.Fill };
+        var blackEloCard = CreatePlayerScoreCard(isWhitePlayer: false, out lblBlackElo);
+
+        pnl.Controls.Add(lblEloTitle, 0, 0);
+        pnl.Controls.Add(whiteEloCard, 1, 0);
+        pnl.Controls.Add(spacer, 2, 0);
+        pnl.Controls.Add(blackEloCard, 3, 0);
+
+        return pnl;
+    }
+
+    private TableLayoutPanel CreatePhasesTable()
+    {
+        _tablePhases = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            Height = 122,
+            ColumnCount = 4,
+            RowCount = 3,
+            BackColor = ChessTheme.PanelDark,
+            Padding = new Padding(0, 2, 0, 2)
+        };
+
+        _tablePhases.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 40f));
+        _tablePhases.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 19f));
+        _tablePhases.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 22f));
+        _tablePhases.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 19f));
+
+        for (int r = 0; r < 3; r++)
+        {
+            _tablePhases.RowStyles.Add(new RowStyle(SizeType.Absolute, 38f));
+        }
+
+        // Row 0: Дебют
+        var lblOpening = CreatePhaseTitleLabel("Дебют");
+        var cellWOpen = CreatePhaseCell(out _picWhiteOpening, out _lblWhiteOpeningDash);
+        var spacerOpen = new Label { Dock = DockStyle.Fill };
+        var cellBOpen = CreatePhaseCell(out _picBlackOpening, out _lblBlackOpeningDash);
+        _tablePhases.Controls.Add(lblOpening, 0, 0);
+        _tablePhases.Controls.Add(cellWOpen, 1, 0);
+        _tablePhases.Controls.Add(spacerOpen, 2, 0);
+        _tablePhases.Controls.Add(cellBOpen, 3, 0);
+
+        // Row 1: Миттельшпиль
+        var lblMiddle = CreatePhaseTitleLabel("Миттельшпиль");
+        var cellWMiddle = CreatePhaseCell(out _picWhiteMiddlegame, out _lblWhiteMiddlegameDash);
+        var spacerMiddle = new Label { Dock = DockStyle.Fill };
+        var cellBMiddle = CreatePhaseCell(out _picBlackMiddlegame, out _lblBlackMiddlegameDash);
+        _tablePhases.Controls.Add(lblMiddle, 0, 1);
+        _tablePhases.Controls.Add(cellWMiddle, 1, 1);
+        _tablePhases.Controls.Add(spacerMiddle, 2, 1);
+        _tablePhases.Controls.Add(cellBMiddle, 3, 1);
+
+        // Row 2: Эндшпиль
+        var lblEnd = CreatePhaseTitleLabel("Эндшпиль");
+        var cellWEnd = CreatePhaseCell(out _picWhiteEndgame, out _lblWhiteEndgameDash);
+        var spacerEnd = new Label { Dock = DockStyle.Fill };
+        var cellBEnd = CreatePhaseCell(out _picBlackEndgame, out _lblBlackEndgameDash);
+        _tablePhases.Controls.Add(lblEnd, 0, 2);
+        _tablePhases.Controls.Add(cellWEnd, 1, 2);
+        _tablePhases.Controls.Add(spacerEnd, 2, 2);
+        _tablePhases.Controls.Add(cellBEnd, 3, 2);
+
+        return _tablePhases;
+    }
+
+    private static Label CreatePhaseTitleLabel(string text)
+    {
+        return new Label
+        {
+            Text = text,
+            Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
+            ForeColor = Color.FromArgb(220, 218, 215),
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Padding = new Padding(4, 0, 0, 0)
+        };
+    }
+
+    private static Panel CreatePhaseCell(out PictureBox pic, out Label dash)
+    {
+        var pnl = new Panel
+        {
+            Dock = DockStyle.Fill,
+            BackColor = Color.Transparent
+        };
+
+        pic = new PictureBox
+        {
+            Size = new Size(30, 30),
+            SizeMode = PictureBoxSizeMode.Zoom,
+            BackColor = Color.Transparent,
+            Visible = false
+        };
+
+        dash = new Label
+        {
+            Text = "—",
+            ForeColor = Color.FromArgb(120, 118, 115),
+            Font = new Font("Segoe UI", 13f, FontStyle.Bold),
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleCenter,
+            BackColor = Color.Transparent,
+            Visible = true
+        };
+
+        pnl.Controls.Add(pic);
+        pnl.Controls.Add(dash);
+
+        var p = pic;
+        void CenterPic()
+        {
+            p.Location = new Point(Math.Max(0, (pnl.Width - p.Width) / 2), Math.Max(0, (pnl.Height - p.Height) / 2));
+        }
+        CenterPic();
+        pnl.Resize += (s, e) => CenterPic();
+
+        return pnl;
+    }
+
+    private void UpdatePhasesData(GameAnalysis analysis)
+    {
+        SetPhaseBadge(_picWhiteOpening, _lblWhiteOpeningDash, analysis.WhitePhases.OpeningPerformance, "Дебют (Белые)", analysis.WhitePhases.OpeningAccuracy);
+        SetPhaseBadge(_picBlackOpening, _lblBlackOpeningDash, analysis.BlackPhases.OpeningPerformance, "Дебют (Черные)", analysis.BlackPhases.OpeningAccuracy);
+
+        SetPhaseBadge(_picWhiteMiddlegame, _lblWhiteMiddlegameDash, analysis.WhitePhases.MiddlegamePerformance, "Миттельшпиль (Белые)", analysis.WhitePhases.MiddlegameAccuracy);
+        SetPhaseBadge(_picBlackMiddlegame, _lblBlackMiddlegameDash, analysis.BlackPhases.MiddlegamePerformance, "Миттельшпиль (Черные)", analysis.BlackPhases.MiddlegameAccuracy);
+
+        SetPhaseBadge(_picWhiteEndgame, _lblWhiteEndgameDash, analysis.WhitePhases.EndgamePerformance, "Эндшпиль (Белые)", analysis.WhitePhases.EndgameAccuracy);
+        SetPhaseBadge(_picBlackEndgame, _lblBlackEndgameDash, analysis.BlackPhases.EndgamePerformance, "Эндшпиль (Черные)", analysis.BlackPhases.EndgameAccuracy);
+    }
+
+    private void ResetPhasesData()
+    {
+        SetPhaseBadge(_picWhiteOpening, _lblWhiteOpeningDash, null, "", null);
+        SetPhaseBadge(_picBlackOpening, _lblBlackOpeningDash, null, "", null);
+        SetPhaseBadge(_picWhiteMiddlegame, _lblWhiteMiddlegameDash, null, "", null);
+        SetPhaseBadge(_picBlackMiddlegame, _lblBlackMiddlegameDash, null, "", null);
+        SetPhaseBadge(_picWhiteEndgame, _lblWhiteEndgameDash, null, "", null);
+        SetPhaseBadge(_picBlackEndgame, _lblBlackEndgameDash, null, "", null);
+    }
+
+    private void SetPhaseBadge(PictureBox pic, Label dash, MoveClassification? classification, string phaseName, double? accuracy)
+    {
+        if (classification.HasValue)
+        {
+            pic.Image = ResourceManager.GetBadgeImage(classification.Value);
+            pic.Visible = true;
+            dash.Visible = false;
+            if (pic.Parent != null)
+            {
+                pic.Location = new Point(Math.Max(0, (pic.Parent.Width - pic.Width) / 2), Math.Max(0, (pic.Parent.Height - pic.Height) / 2));
+            }
+            string accStr = accuracy.HasValue ? $" ({accuracy.Value:0.#}%)" : "";
+            _toolTip.SetToolTip(pic, $"{phaseName}: {classification.Value.GetTitle()}{accStr}");
+        }
+        else
+        {
+            pic.Visible = false;
+            pic.Image = null;
+            dash.Visible = true;
+            _toolTip.SetToolTip(pic, string.Empty);
+        }
+    }
+
+    private Panel CreatePlayerScoreCard(bool isWhitePlayer, out Label lblScore)
     {
         var card = new Panel
         {
-            BackColor = Color.White
+            Dock = DockStyle.Fill,
+            BackColor = isWhitePlayer ? Color.White : Color.FromArgb(38, 36, 34),
+            Margin = new Padding(2, 2, 2, 2)
         };
         card.Paint += (s, e) =>
         {
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             using var path = CreateRoundedPath(new Rectangle(0, 0, card.Width - 1, card.Height - 1), 6);
-            using var bg = new SolidBrush(Color.White);
+            using var bg = new SolidBrush(isWhitePlayer ? Color.White : Color.FromArgb(38, 36, 34));
             e.Graphics.FillPath(bg, path);
+            if (!isWhitePlayer)
+            {
+                using var borderPen = new Pen(Color.FromArgb(70, 68, 65), 1.2f);
+                e.Graphics.DrawPath(borderPen, path);
+            }
         };
 
         lblScore = new Label
         {
             Text = "--.-",
-            Font = new Font("Segoe UI", 14f, FontStyle.Bold),
-            ForeColor = Color.FromArgb(33, 32, 29),
+            Font = new Font("Segoe UI", 13.5f, FontStyle.Bold),
+            ForeColor = isWhitePlayer ? Color.FromArgb(28, 27, 24) : Color.FromArgb(245, 245, 245),
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleCenter,
             BackColor = Color.Transparent
@@ -892,11 +1237,11 @@ public partial class Form1 : Form
         int row = 0;
         foreach (var c in order)
         {
-            _tableBadges.RowStyles.Add(new RowStyle(SizeType.Absolute, 34f));
+            _tableBadges.RowStyles.Add(new RowStyle(SizeType.Absolute, 38f));
 
             string title = c switch
             {
-                MoveClassification.Good => "Хороший",
+                MoveClassification.Good => "Неплохой",
                 MoveClassification.MissedWin => "Упущенный шанс",
                 _ => c.GetTitle()
             };
@@ -907,13 +1252,14 @@ public partial class Form1 : Form
                 ForeColor = Color.FromArgb(220, 218, 215),
                 Font = new Font("Segoe UI", 9.5f, FontStyle.Regular),
                 Dock = DockStyle.Fill,
-                TextAlign = ContentAlignment.MiddleLeft
+                TextAlign = ContentAlignment.MiddleLeft,
+                Padding = new Padding(6, 0, 0, 0)
             };
 
             var lblW = new Label
             {
                 Text = "0",
-                ForeColor = Color.White,
+                ForeColor = c.GetThemeColor(),
                 Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
                 Dock = DockStyle.Fill,
                 TextAlign = ContentAlignment.MiddleCenter,
@@ -922,17 +1268,17 @@ public partial class Form1 : Form
 
             var picBadge = new PictureBox
             {
-                Size = new Size(32, 32),
+                Size = new Size(28, 28),
                 SizeMode = PictureBoxSizeMode.Zoom,
                 Dock = DockStyle.Fill,
-                Margin = new Padding(0, 1, 0, 1),
+                Margin = new Padding(0, 3, 0, 3),
                 Image = ResourceManager.GetBadgeImage(c)
             };
 
             var lblB = new Label
             {
                 Text = "0",
-                ForeColor = Color.White,
+                ForeColor = c.GetThemeColor(),
                 Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
                 Dock = DockStyle.Fill,
                 TextAlign = ContentAlignment.MiddleCenter,
@@ -958,58 +1304,68 @@ public partial class Form1 : Form
             BackColor = ChessTheme.PanelDark
         };
 
-        // Variation Banner
-        _pnlVariationBanner = new Panel
+        // 1. Evaluation Graph (Top of Sidebar, Height 64px)
+        _graphControl = new GameGraphControl
         {
             Dock = DockStyle.Top,
-            Height = 36,
-            BackColor = Color.FromArgb(32, 45, 60),
-            Padding = new Padding(10, 4, 10, 4),
-            Visible = false
+            Height = 64,
+            BackColor = ChessTheme.PanelDarker
         };
-
-        _lblVariationTitle = new Label
+        _graphControl.PlySelected += ply =>
         {
-            Text = "Вариант: ...",
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-            ForeColor = Color.FromArgb(170, 215, 255),
-            Dock = DockStyle.Left,
-            TextAlign = ContentAlignment.MiddleLeft,
-            AutoSize = true
+            GoToPly(ply);
+            SwitchSidebarView("review");
         };
 
-        _btnExitVariation = new RoundedButton
+        // 2. Move Review Card (Directly above computer lines, matching reference images)
+        _moveReviewCard = new MoveReviewCardControl
         {
-            Text = "Вернуться в партию",
-            Width = 145,
-            Height = 28,
-            BorderRadius = 5,
-            NormalColor = Color.FromArgb(48, 56, 68),
-            HoverColor = Color.FromArgb(64, 75, 92),
-            Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
-            Dock = DockStyle.Right
+            Dock = DockStyle.Top
         };
-        _btnExitVariation.Click += (s, e) => ExitVariation();
+        _moveReviewCard.PlayedRowClicked += () =>
+        {
+            if (_currentPlyIndex >= 0) GoToPly(_currentPlyIndex);
+        };
+        _moveReviewCard.BestRowClicked += () =>
+        {
+            if (_currentPlyIndex >= 0)
+            {
+                OnCalloutTokenClicked(_currentPlyIndex, 0);
+            }
+        };
 
-        _pnlVariationBanner.Controls.Add(_lblVariationTitle);
-        _pnlVariationBanner.Controls.Add(_btnExitVariation);
+        // 3. Real-time Computer Lines Control (Thick rows, height dynamically updated)
+        _computerLines = new ComputerLinesControl
+        {
+            Dock = DockStyle.Top
+        };
+        _computerLines.UpdateHeight();
+        _computerLines.SettingsClicked += (s, e) =>
+        {
+            _menuSettings.Show(_computerLines, new Point(10, _computerLines.Height));
+        };
 
-        // Move History Table (Fills ALL available space, 15-16 visible rows)
+        // 4. Dedicated Opening Bar
+        _pnlOpeningBar = CreateOpeningBar();
+
+        // 5. Move History Table (Fills ALL available space)
         _moveHistory = new MoveHistoryControl
         {
             Dock = DockStyle.Fill
         };
         _moveHistory.MoveSelected += ply => GoToPly(ply);
+        _moveHistory.CalloutClicked += OnCalloutCardClicked;
+        _moveHistory.CalloutTokenClicked += OnCalloutTokenClicked;
         _moveHistory.MoveHovered += ply =>
         {
             if (ply >= 0 && _currentAnalysis != null && ply < _currentAnalysis.Moves.Count)
             {
                 var ma = _currentAnalysis.Moves[ply];
                 _boardControl.ClearArrows();
-                _boardControl.AddArrow(ma.Move.From, ma.Move.To, Color.FromArgb(240, 255, 255, 255), width: 7f, hasOutline: true);
-                if (ma.BestMove.HasValue && ma.BestMove.Value != ma.Move)
+                _boardControl.AddArrow(ma.Move.From, ma.Move.To, Color.FromArgb(105, 255, 255, 255), width: 14f, hasOutline: true);
+                if (_showBestMoveArrow && ma.BestMove.HasValue && ma.BestMove.Value != ma.Move)
                 {
-                    _boardControl.AddArrow(ma.BestMove.Value.From, ma.BestMove.Value.To, Color.FromArgb(210, 28, 28, 32), width: 8f);
+                    _boardControl.AddArrow(ma.BestMove.Value.From, ma.BestMove.Value.To, Color.FromArgb(105, 52, 152, 219), width: 14f, hasOutline: true);
                 }
             }
             else if (ply == -1)
@@ -1018,20 +1374,20 @@ public partial class Form1 : Form
             }
         };
 
-        // Bottom Playback Controls Bar (Phase 7: Enlarged 70px x 48px buttons)
+        // 6. Bottom Playback Controls Bar (Large 76x52px and 90x52px vector buttons)
         var pnlPlayback = new Panel
         {
             Dock = DockStyle.Bottom,
-            Height = 62,
+            Height = 68,
             BackColor = ChessTheme.PanelDarker,
-            Padding = new Padding(10, 7, 10, 7)
+            Padding = new Padding(10, 8, 10, 8)
         };
 
-        _btnFirst = CreateNavButton("|<", (s, e) => GoToPly(-1), 70);
-        _btnPrev = CreateNavButton("<", (s, e) => GoToPly(_currentPlyIndex - 1), 70);
-        _btnAutoPlay = CreateNavButton("▶", (s, e) => ToggleAutoPlay(), 80);
-        _btnNext = CreateNavButton(">", (s, e) => GoToPly(_currentPlyIndex + 1), 70);
-        _btnLast = CreateNavButton(">|", (s, e) => GoToPly(_currentGame.Moves.Count - 1), 70);
+        _btnFirst = CreateNavButton(ButtonIconType.First, (s, e) => GoToFirst(), 76);
+        _btnPrev = CreateNavButton(ButtonIconType.Prev, (s, e) => StepBackward(), 76);
+        _btnAutoPlay = CreateNavButton(ButtonIconType.Play, (s, e) => ToggleAutoPlay(), 90);
+        _btnNext = CreateNavButton(ButtonIconType.Next, (s, e) => StepForward(), 76);
+        _btnLast = CreateNavButton(ButtonIconType.Last, (s, e) => GoToLast(), 76);
 
         var flowNav = new FlowLayoutPanel
         {
@@ -1048,34 +1404,374 @@ public partial class Form1 : Form
         // Center the buttons in the playback bar
         pnlPlayback.Resize += (s, e) =>
         {
-            int totalBtnW = (70 * 4) + 80 + (8 * 4);
+            int totalBtnW = (76 * 4) + 90 + (8 * 4);
             int pad = Math.Max(0, (pnlPlayback.Width - totalBtnW) / 2);
             flowNav.Padding = new Padding(pad, 0, 0, 0);
         };
 
         pnlPlayback.Controls.Add(flowNav);
 
-        pnl.Controls.Add(_pnlVariationBanner);
-        pnl.Controls.Add(pnlPlayback);
+        _pnlVariationBox = CreateVariationBox();
+
         pnl.Controls.Add(_moveHistory);
-        _moveHistory.BringToFront();
+        pnl.Controls.Add(pnlPlayback);
+        pnl.Controls.Add(_pnlVariationBox);
+        pnl.Controls.Add(_pnlOpeningBar);
+        pnl.Controls.Add(_computerLines);
+        pnl.Controls.Add(_moveReviewCard);
+        pnl.Controls.Add(_graphControl);
 
         return pnl;
     }
 
-    private static RoundedButton CreateNavButton(string text, EventHandler onClick, int width)
+    private Panel CreateVariationBox()
+    {
+        var box = new Panel
+        {
+            Dock = DockStyle.Top,
+            Height = 74,
+            BackColor = Color.FromArgb(32, 30, 28),
+            Padding = new Padding(10, 6, 10, 6),
+            Visible = false
+        };
+
+        box.Paint += (s, e) =>
+        {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using var borderPen = new Pen(Color.FromArgb(65, 63, 60), 1.2f);
+            using var path = CreateRoundedPath(new Rectangle(2, 2, box.Width - 5, box.Height - 5), 6);
+            e.Graphics.DrawPath(borderPen, path);
+        };
+
+        var pnlHeader = new Panel
+        {
+            Dock = DockStyle.Top,
+            Height = 26,
+            BackColor = Color.Transparent
+        };
+
+        _lblVariationTitle = new Label
+        {
+            Text = "🔀 Отступление от партии",
+            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+            ForeColor = Color.FromArgb(220, 218, 214),
+            Dock = DockStyle.Left,
+            AutoSize = true,
+            TextAlign = ContentAlignment.MiddleLeft
+        };
+
+        var btnExit = new RoundedButton
+        {
+            Text = "✕ Вернуться",
+            Dock = DockStyle.Right,
+            Width = 98,
+            Height = 24,
+            BorderRadius = 4,
+            NormalColor = Color.FromArgb(48, 46, 43),
+            HoverColor = Color.FromArgb(65, 63, 60),
+            CustomBorderColor = Color.FromArgb(75, 73, 70),
+            Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+            ForeColor = Color.FromArgb(235, 235, 235)
+        };
+        btnExit.Click += (s, e) => ExitVariation();
+
+        pnlHeader.Controls.Add(_lblVariationTitle);
+        pnlHeader.Controls.Add(btnExit);
+
+        _flowVariationMoves = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoScroll = true,
+            WrapContents = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            BackColor = Color.Transparent,
+            Padding = new Padding(0, 4, 0, 0)
+        };
+
+        box.Controls.Add(_flowVariationMoves);
+        box.Controls.Add(pnlHeader);
+
+        return box;
+    }
+
+    private void ExitVariation()
+    {
+        int returnPly = _variationBranchPly;
+        _activeVariation.Clear();
+        _activeVariationIndex = -1;
+        _variationBranchPly = -1;
+        _moveHistory.ClearVariation();
+        _boardControl.IsAtGameEnd = false;
+        _pnlVariationBox.Height = 72;
+        UpdateVariationBoxUi();
+        GoToPly(returnPly);
+    }
+
+    private void UpdateVariationBoxUi()
+    {
+        if (_activeVariation.Count == 0)
+        {
+            _pnlVariationBox.Visible = false;
+            _flowVariationMoves.Controls.Clear();
+            _pnlVariationBox.Height = 72;
+            return;
+        }
+
+        _pnlVariationBox.Visible = true;
+
+        int moveCount = _activeVariation.Count;
+        int targetHeight = moveCount <= 4 ? 72 : (moveCount <= 8 ? 104 : 136);
+        if (_pnlVariationBox.Height != targetHeight)
+        {
+            _pnlVariationBox.Height = targetHeight;
+        }
+
+        int branchMoveNum = _variationBranchPly >= 0 ? (_variationBranchPly / 2) + 1 : 1;
+        bool branchIsWhite = _variationBranchPly < 0 || _variationBranchPly % 2 == 1;
+
+        _lblVariationTitle.Text = $"🔀 Отступление от хода {branchMoveNum}{(!branchIsWhite ? "..." : ".")}";
+
+        // Fast update if button count already matches variation steps: no flicker, no button destruction!
+        if (_flowVariationMoves.Controls.Count == _activeVariation.Count)
+        {
+            for (int i = 0; i < _activeVariation.Count; i++)
+            {
+                if (_flowVariationMoves.Controls[i] is Button b)
+                {
+                    bool isActive = (i == _activeVariationIndex);
+                    b.BackColor = isActive ? ChessTheme.AccentGreen : Color.FromArgb(46, 44, 41);
+                    b.ForeColor = isActive ? Color.White : Color.FromArgb(220, 218, 215);
+                    b.Font = new Font("Segoe UI", 8.5f, isActive ? FontStyle.Bold : FontStyle.Regular);
+                    b.FlatAppearance.BorderColor = isActive ? ChessTheme.AccentGreen : Color.FromArgb(68, 66, 62);
+                }
+            }
+            return;
+        }
+
+        _flowVariationMoves.SuspendLayout();
+        _flowVariationMoves.Controls.Clear();
+
+        for (int i = 0; i < _activeVariation.Count; i++)
+        {
+            int stepIdx = i;
+            var step = _activeVariation[i];
+            bool isActive = (i == _activeVariationIndex);
+
+            int currentMoveNum = branchMoveNum + ((branchIsWhite ? i : i + 1) / 2);
+            bool isWhiteMove = branchIsWhite ? (i % 2 == 0) : (i % 2 == 1);
+            string prefix = isWhiteMove ? $"{currentMoveNum}. " : (i == 0 ? $"{currentMoveNum}... " : "");
+
+            var btn = new Button
+            {
+                Text = prefix + step.San,
+                AutoSize = true,
+                Height = 26,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 8.5f, isActive ? FontStyle.Bold : FontStyle.Regular),
+                BackColor = isActive ? ChessTheme.AccentGreen : Color.FromArgb(46, 44, 41),
+                ForeColor = isActive ? Color.White : Color.FromArgb(220, 218, 215),
+                Cursor = Cursors.Hand,
+                Margin = new Padding(2, 1, 2, 1)
+            };
+            btn.FlatAppearance.BorderSize = 1;
+            btn.FlatAppearance.BorderColor = isActive ? ChessTheme.AccentGreen : Color.FromArgb(68, 66, 62);
+
+            btn.Click += (s, e) =>
+            {
+                _activeVariationIndex = stepIdx;
+                DisplayVariationStep(stepIdx);
+                UpdateVariationBoxUi();
+            };
+
+            _flowVariationMoves.Controls.Add(btn);
+        }
+
+        _flowVariationMoves.ResumeLayout();
+    }
+
+    private Panel CreateOpeningBar()
+    {
+        var bar = new Panel
+        {
+            Dock = DockStyle.Top,
+            Height = 32,
+            BackColor = Color.FromArgb(28, 27, 24),
+            Padding = new Padding(12, 0, 10, 0)
+        };
+        bar.Paint += (s, e) =>
+        {
+            using var borderPen = new Pen(ChessTheme.BorderColor, 1f);
+            e.Graphics.DrawLine(borderPen, 0, bar.Height - 1, bar.Width, bar.Height - 1);
+        };
+
+        _lblOpeningName = new Label
+        {
+            Text = "📘 Начальная позиция",
+            Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+            ForeColor = Color.FromArgb(225, 223, 220),
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            AutoEllipsis = true
+        };
+
+        var lblBookIcon = new Label
+        {
+            Text = "📖",
+            Font = new Font("Segoe UI", 10.5f),
+            ForeColor = Color.FromArgb(160, 158, 155),
+            Dock = DockStyle.Right,
+            Width = 28,
+            TextAlign = ContentAlignment.MiddleCenter,
+            Cursor = Cursors.Hand
+        };
+
+        bar.Controls.Add(_lblOpeningName);
+        bar.Controls.Add(lblBookIcon);
+        return bar;
+    }
+
+    private void SetOpeningName(string? opening)
+    {
+        if (_lblOpeningName == null) return;
+        if (string.IsNullOrWhiteSpace(opening))
+        {
+            if (!string.IsNullOrEmpty(_lastBookOpeningName))
+            {
+                opening = _lastBookOpeningName;
+            }
+            else
+            {
+                opening = "Дебют: Произвольная партия";
+            }
+        }
+        else if (opening != "Начальная позиция" && opening != "Дебют: Произвольная партия")
+        {
+            _lastBookOpeningName = opening;
+        }
+
+        string clean = opening.StartsWith("📘") ? opening : $"📘 {opening}";
+        _lblOpeningName.Text = clean;
+    }
+
+    private void TriggerStartupAnalysis()
+    {
+        if (_engine == null) return;
+        var startBoard = new BoardState();
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var eval = await _engine.AnalyzePositionAsync(startBoard.ToFen(), depth: _analysisDepth, nodes: 400_000);
+                if (_currentPlyIndex == -1 && !_isAnalyzingGame && _currentGame.Moves.Count == 0)
+                {
+                    Invoke(() =>
+                    {
+                        if (_currentPlyIndex == -1 && !_isAnalyzingGame && _currentGame.Moves.Count == 0)
+                        {
+                            _lastPositionEval = eval;
+                            _currentFenEval = eval;
+                            _currentEvalFen = startBoard.ToFen();
+                            _evalBar.SetEvaluation(eval);
+                            _computerLines.SetLines(eval, startBoard);
+                        }
+                    });
+                }
+            }
+            catch { }
+        });
+    }
+
+    private void PlayBestMovePreview()
+    {
+        if (_currentAnalysis == null || _currentPlyIndex < 0 || _currentPlyIndex >= _currentAnalysis.Moves.Count)
+        {
+            return;
+        }
+
+        var ma = _currentAnalysis.Moves[_currentPlyIndex];
+        if (ma.BestMove.HasValue && !ma.BestMove.Value.IsEmpty)
+        {
+            var bm = ma.BestMove.Value;
+            var board = new BoardState();
+            board.LoadFen(ma.FenBefore);
+            board.ApplyMove(bm);
+
+            if (bm.IsCapture) SoundService.PlayCapture(); else SoundService.PlayMove();
+
+            _boardControl.IsAtGameEnd = false;
+            _boardControl.SetPosition(board, bm.From, bm.To, MoveClassification.Best, animate: true);
+            UpdateCapturedPieces(board);
+
+            _boardControl.ClearArrows();
+            _boardControl.AddArrow(bm.From, bm.To, Color.FromArgb(204, 129, 182, 76), width: 7.5f, hasOutline: true);
+        }
+    }
+
+    private static string FormatEvalPill(int centipawns, int? mateIn)
+    {
+        if (mateIn.HasValue)
+        {
+            int m = mateIn.Value;
+            if (m == 0) return "#";
+            return m > 0 ? $"M{m}" : $"-M{Math.Abs(m)}";
+        }
+        double val = centipawns / 100.0;
+        if (Math.Abs(val) < 0.005) return "0.00";
+        return val >= 0
+            ? string.Create(System.Globalization.CultureInfo.InvariantCulture, $"+{val:0.00}")
+            : string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{val:0.00}");
+    }
+
+    private static string FormatPvLine(List<string> pv, BoardState board)
+    {
+        if (pv == null || pv.Count == 0) return "";
+
+        var tempBoard = board.Clone();
+        var parts = new List<string>();
+        int moveCount = Math.Min(5, pv.Count);
+
+        for (int i = 0; i < moveCount; i++)
+        {
+            string uci = pv[i];
+            string san = AnalysisService.ConvertUciToSan(tempBoard.ToFen(), uci);
+            if (string.IsNullOrEmpty(san)) san = uci;
+
+            int moveNum = tempBoard.FullmoveNumber;
+            bool isWhite = tempBoard.SideToMove == PieceColor.White;
+
+            if (i == 0)
+            {
+                parts.Add(isWhite ? $"{moveNum}. {san}" : $"{moveNum}... {san}");
+            }
+            else if (isWhite)
+            {
+                parts.Add($"{moveNum}. {san}");
+            }
+            else
+            {
+                parts.Add(san);
+            }
+
+            var mv = Core.Chess.Move.FromUci(uci);
+            if (mv.IsEmpty) break;
+            tempBoard.ApplyMove(mv);
+        }
+
+        return string.Join(" ", parts) + (pv.Count > moveCount ? "..." : "");
+    }
+
+    private static RoundedButton CreateNavButton(ButtonIconType iconType, EventHandler onClick, int width)
     {
         var btn = new RoundedButton
         {
-            Text = text,
+            IconType = iconType,
             Width = width,
-            Height = 48,
+            Height = 52,
             BorderRadius = 10,
             NormalColor = Color.FromArgb(48, 46, 43),
             HoverColor = Color.FromArgb(64, 62, 58),
             PressedColor = Color.FromArgb(80, 78, 72),
-            Font = new Font("Segoe UI", 13.5f, FontStyle.Bold),
-            ForeColor = Color.White,
+            CustomBorderColor = Color.FromArgb(70, 68, 65),
             Margin = new Padding(4, 0, 4, 0)
         };
         btn.Click += onClick;
@@ -1088,11 +1784,31 @@ public partial class Form1 : Form
     {
         try
         {
-            string? enginePath = StockfishEngine.FindStockfishPath();
+            string? enginePath = _initialEnginePath;
+            if (string.IsNullOrWhiteSpace(enginePath) || !File.Exists(enginePath))
+            {
+                var settings = AppSettings.Load();
+                enginePath = settings.StockfishPath;
+            }
+            if (string.IsNullOrWhiteSpace(enginePath) || !File.Exists(enginePath))
+            {
+                enginePath = StockfishEngine.FindStockfishPath();
+            }
+
             if (!string.IsNullOrEmpty(enginePath) && File.Exists(enginePath))
             {
                 _engine = new StockfishEngine(enginePath);
                 _analysisService = new AnalysisService(_engine);
+                _computerLines.LineCount = _settings.MultiPv;
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await _engine.StartAsync(threads: _settings.Threads);
+                        await _engine.SetMultiPvAsync(_settings.MultiPv);
+                    }
+                    catch { }
+                });
             }
         }
         catch (Exception ex)
@@ -1103,6 +1819,8 @@ public partial class Form1 : Form
 
     public void LoadPgnFromText(string pgnText)
     {
+        if (string.IsNullOrWhiteSpace(pgnText)) return;
+        pgnText = pgnText.Trim().TrimStart('\uFEFF');
         var games = PgnParser.ParseGames(pgnText);
         if (games.Count > 0)
         {
@@ -1112,6 +1830,56 @@ public partial class Form1 : Form
         {
             MessageBox.Show("Не удалось распознать партию из указанного текста.", "Ошибка PGN", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
+    }
+
+    public void ResetToStartupScreen()
+    {
+        StopAutoPlay();
+        _analysisCts?.Cancel();
+        _variationCts?.Cancel();
+        _isAnalyzingGame = false;
+        _progressBar.Visible = false;
+
+        _currentGame = new PgnGame();
+        _currentAnalysis = null;
+        _currentPlyIndex = -1;
+        _rawPgnText = string.Empty;
+        _activeVariation.Clear();
+
+        _boardControl.IsFlipped = false;
+        _evalBar.IsFlipped = false;
+        _moveHistory.UserFilterColor = null;
+
+        UpdatePlayerBarLabels("Белые", "Черные");
+        _lblTopClock.Text = "";
+        _lblBottomClock.Text = "";
+        _lblOverviewWhitePlayer.Text = "Белые";
+        _lblOverviewBlackPlayer.Text = "Черные";
+
+        _lblWhiteAccuracy.Text = "--.-";
+        _lblBlackAccuracy.Text = "--.-";
+        _lblWhiteElo.Text = "---";
+        _lblBlackElo.Text = "---";
+        ResetPhasesData();
+
+        var startBoard = new BoardState();
+        _boardControl.SetPosition(startBoard, Square.None, Square.None, null, animate: false);
+        _boardControl.ClearArrows();
+        _boardControl.GameResult = null;
+        _boardControl.IsAtGameEnd = false;
+
+        _moveHistory.EnableCallouts = false;
+        _moveHistory.SetMoves(new List<MoveAnalysis>());
+        _graphControl.Clear();
+        _moveReviewCard.Visible = false;
+        _moveReviewCard.Clear();
+        _pnlVariationBox.Visible = false;
+        _evalBar.Reset();
+        UpdateCapturedPieces(startBoard);
+        SetOpeningName("Начальная позиция");
+        SwitchSidebarView("review");
+
+        TriggerStartupAnalysis();
     }
 
     public void LoadGame(PgnGame game, string? rawPgn = null)
@@ -1143,8 +1911,8 @@ public partial class Form1 : Form
 
         UpdatePlayerBarLabels(wPlayer + wElo, bPlayer + bElo);
 
-        string op = game.Headers.TryGetValue("Opening", out var openingHeader) && !string.IsNullOrWhiteSpace(openingHeader) ? $" • {openingHeader}" : "";
-        _lblGameTitle.Text = $"{wPlayer} — {bPlayer}{op}";
+        string opHeader = game.Headers.TryGetValue("Opening", out var openingHeader) && !string.IsNullOrWhiteSpace(openingHeader) ? openingHeader : (!string.IsNullOrEmpty(game.Opening) ? game.Opening : "Партия загружена");
+        SetOpeningName(opHeader);
 
         string clockText = "10:00";
         if (game.Headers.TryGetValue("TimeControl", out var tc) && !string.IsNullOrWhiteSpace(tc))
@@ -1167,6 +1935,7 @@ public partial class Form1 : Form
         _lblBlackAccuracy.Text = "--.-";
         _lblWhiteElo.Text = "---";
         _lblBlackElo.Text = "---";
+        ResetPhasesData();
 
         var preliminaryMoves = new List<MoveAnalysis>();
         for (int i = 0; i < game.Moves.Count; i++)
@@ -1181,8 +1950,23 @@ public partial class Form1 : Form
                 Move = m.Move,
                 FenBefore = m.FenBefore,
                 FenAfter = m.FenAfter,
-                Classification = MoveClassification.Good
+                Classification = m.ExpectedClassification ?? MoveClassification.Good
             });
+        }
+
+        // If PGN contains pre-annotated moves from Chess.com, calculate phases immediately!
+        if (game.Moves.Any(m => m.ExpectedClassification.HasValue))
+        {
+            var prelimAnalysis = new GameAnalysis { Game = game };
+            prelimAnalysis.Moves.AddRange(preliminaryMoves);
+            foreach (var pm in preliminaryMoves)
+            {
+                if (pm.Color == PieceColor.White) prelimAnalysis.WhiteBadgeCounts[pm.Classification]++;
+                else prelimAnalysis.BlackBadgeCounts[pm.Classification]++;
+            }
+            GamePhasesService.CalculatePhases(prelimAnalysis);
+            UpdatePhasesData(prelimAnalysis);
+            UpdateBadgeCountLabels(prelimAnalysis);
         }
 
         _moveHistory.SetMoves(preliminaryMoves);
@@ -1278,31 +2062,221 @@ public partial class Form1 : Form
     #endregion
 
     #region Navigation & Position Updating
-    private void GoToPly(int plyIndex)
+    private void StepBackward()
+    {
+        if (_activeVariation.Count > 0)
+        {
+            if (_activeVariationIndex > 0)
+            {
+                _activeVariationIndex--;
+                DisplayVariationStep(_activeVariationIndex);
+                UpdateVariationBoxUi();
+            }
+            else if (_activeVariationIndex == 0)
+            {
+                // Step back to position BEFORE first move of variation, keeping variation active
+                _activeVariationIndex = -1;
+                var baseBoard = new BoardState();
+                baseBoard.LoadFen(_activeVariation[0].FenBefore);
+                _boardControl.SetPosition(baseBoard, Square.None, Square.None, null, animate: true);
+                UpdateCapturedPieces(baseBoard);
+                _computerLines.ClearLines();
+                UpdateVariationBoxUi();
+                TriggerVariationEngineAnalysis(_activeVariation[0].FenBefore);
+            }
+            else
+            {
+                // Already at -1: exit variation and step backward in base game
+                int returnPly = _variationBranchPly;
+                _activeVariation.Clear();
+                _activeVariationIndex = -1;
+                _variationBranchPly = -1;
+                _moveHistory.ClearVariation();
+                UpdateVariationBoxUi();
+                GoToPly(returnPly);
+            }
+        }
+        else
+        {
+            if (_currentPlyIndex <= -1) return;
+            GoToPly(_currentPlyIndex - 1);
+        }
+    }
+
+    private void StepForward()
+    {
+        if (_activeVariation.Count > 0)
+        {
+            if (_activeVariationIndex + 1 < _activeVariation.Count)
+            {
+                _activeVariationIndex++;
+                DisplayVariationStep(_activeVariationIndex);
+                UpdateVariationBoxUi();
+            }
+        }
+        else
+        {
+            if (_currentGame.Moves.Count == 0 || _currentPlyIndex >= _currentGame.Moves.Count - 1)
+            {
+                return;
+            }
+            GoToPly(_currentPlyIndex + 1);
+        }
+    }
+
+    private void GoToFirst()
+    {
+        _activeVariation.Clear();
+        _activeVariationIndex = -1;
+        _variationBranchPly = -1;
+        _moveHistory.ClearVariation();
+        UpdateVariationBoxUi();
+        GoToPly(-1);
+    }
+
+    private void GoToLast()
+    {
+        _activeVariation.Clear();
+        _activeVariationIndex = -1;
+        _variationBranchPly = -1;
+        _moveHistory.ClearVariation();
+        UpdateVariationBoxUi();
+        GoToPly(_currentGame.Moves.Count - 1);
+    }
+
+    private void DisplayVariationStep(int index)
+    {
+        if (index < 0 || index >= _activeVariation.Count) return;
+        var step = _activeVariation[index];
+        var board = new BoardState();
+        board.LoadFen(step.FenAfter);
+
+        _boardControl.IsAtGameEnd = false;
+        _boardControl.SetPosition(board, step.Move.From, step.Move.To, step.Classification, animate: false);
+
+        // Ensure capture sound plays if move was a capture or SAN contains 'x'
+        var moveForSound = step.Move;
+        if ((step.San.Contains('x') || step.Move.IsCapture) && !moveForSound.IsCapture)
+        {
+            moveForSound = new Move(moveForSound.From, moveForSound.To, moveForSound.Promotion, true, moveForSound.IsCastling, moveForSound.IsEnPassant);
+        }
+        PlayMoveSound(moveForSound, board);
+        UpdateCapturedPieces(board);
+
+        string? op = OpeningBook.GetOpeningName(step.FenAfter);
+        if (!string.IsNullOrEmpty(op))
+        {
+            _lastBookOpeningName = op;
+            SetOpeningName(op);
+        }
+        else if (!string.IsNullOrEmpty(_lastBookOpeningName))
+        {
+            SetOpeningName(_lastBookOpeningName);
+        }
+
+        if (step.PostEval != null)
+        {
+            _evalBar.SetEvaluation(step.PostEval);
+            _computerLines.SetLines(step.PostEval, board);
+            _currentFenEval = step.PostEval;
+            _currentEvalFen = step.FenAfter;
+        }
+        else
+        {
+            TriggerVariationEngineAnalysis(step.FenAfter);
+        }
+
+        UpdateVariationBoxUi();
+    }
+
+    private void TriggerVariationEngineAnalysis(string fen)
     {
         _variationCts?.Cancel();
-        _variationMoves.Clear();
-        _moveHistory.ClearVariation();
+        _variationCts = new CancellationTokenSource();
+        var ct = _variationCts.Token;
 
+        if (_engine == null || !_engine.IsRunning) return;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var eval = await _engine.AnalyzePositionAsync(fen, depth: _analysisDepth, nodes: 400_000, ct: ct);
+                if (ct.IsCancellationRequested) return;
+
+                Invoke(() =>
+                {
+                    if (!ct.IsCancellationRequested && _boardControl.Board.ToFen() == fen)
+                    {
+                        _evalBar.SetEvaluation(eval);
+                        _computerLines.SetLines(eval, _boardControl.Board);
+                        _currentFenEval = eval;
+                        _currentEvalFen = fen;
+                    }
+                });
+            }
+            catch { }
+        }, ct);
+    }
+
+    private static void PlayMoveSound(Move move, BoardState newBoard)
+    {
+        if (newBoard.IsInCheck(newBoard.SideToMove))
+        {
+            if (newBoard.GenerateLegalMoves().Count == 0)
+            {
+                SoundService.PlayGameEnd();
+            }
+            else
+            {
+                SoundService.PlayCheck();
+            }
+        }
+        else if (move.IsCastling)
+        {
+            SoundService.PlayCastle();
+        }
+        else if (move.Promotion != PieceType.None)
+        {
+            SoundService.PlayPromote();
+        }
+        else if (move.IsCapture)
+        {
+            SoundService.PlayCapture();
+        }
+        else
+        {
+            SoundService.PlayMove();
+        }
+    }
+
+    private void GoToPly(int plyIndex, bool forceRefresh = false)
+    {
         if (_currentGame.Moves.Count == 0)
         {
             _boardControl.Board = new BoardState();
             _boardControl.LastMoveFrom = Square.None;
             _boardControl.LastMoveTo = Square.None;
             _boardControl.LastMoveBadge = null;
+            _boardControl.IsAtGameEnd = false;
             _evalBar.Reset();
+            _moveReviewCard.Clear();
+            SetOpeningName("Начальная позиция");
             return;
         }
 
-        if (_variationMoves.Count > 0)
+        plyIndex = Math.Clamp(plyIndex, -1, _currentGame.Moves.Count - 1);
+        if (!forceRefresh && _currentPlyIndex == plyIndex && _activeVariation.Count == 0)
         {
-            _variationCts?.Cancel();
-            _variationMoves.Clear();
-            _pnlVariationBanner.Visible = false;
-            _moveHistory.ClearVariation();
+            return;
         }
 
-        plyIndex = Math.Clamp(plyIndex, -1, _currentGame.Moves.Count - 1);
+        _variationCts?.Cancel();
+        _activeVariation.Clear();
+        _activeVariationIndex = -1;
+        _variationBranchPly = -1;
+        _moveHistory.ClearVariation();
+        UpdateVariationBoxUi();
         _currentPlyIndex = plyIndex;
 
         _boardControl.ClearArrows();
@@ -1310,8 +2284,57 @@ public partial class Form1 : Form
         if (plyIndex == -1)
         {
             var startBoard = new BoardState();
+            _boardControl.IsAtGameEnd = false;
             _boardControl.SetPosition(startBoard, Square.None, Square.None, null, animate: false);
-            _evalBar.Reset();
+            _moveReviewCard.Clear();
+
+            string op = !string.IsNullOrEmpty(_currentGame.Opening)
+                ? _currentGame.Opening
+                : (OpeningBook.GetOpeningName(startBoard.ToFen()) ?? "Начальная позиция");
+            SetOpeningName(op);
+
+            if (_currentAnalysis != null && _currentAnalysis.Moves.Count > 0)
+            {
+                var firstMa = _currentAnalysis.Moves[0];
+                _currentFenEval = firstMa.PreEval;
+                _currentEvalFen = startBoard.ToFen();
+                _evalBar.SetEvaluation(firstMa.PreEval);
+                _computerLines.SetLines(firstMa.PreEval, startBoard);
+                if (_showBestMoveArrow && firstMa.BestMove.HasValue && !firstMa.BestMove.Value.IsEmpty)
+                {
+                    var bm = firstMa.BestMove.Value;
+                    _boardControl.AddArrow(bm.From, bm.To, Color.FromArgb(105, 52, 152, 219), width: 14f, hasOutline: true);
+                }
+            }
+            else
+            {
+                _evalBar.Reset();
+                _computerLines.ClearLines();
+                if (!_isAnalyzingGame && _engine != null && _engine.IsRunning)
+                {
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var eval = await _engine.AnalyzePositionAsync(startBoard.ToFen(), depth: _analysisDepth, nodes: 400_000);
+                            if (_currentPlyIndex == -1 && !_isAnalyzingGame)
+                            {
+                                Invoke(() =>
+                                {
+                                    if (_currentPlyIndex == -1 && !_isAnalyzingGame)
+                                    {
+                                        _currentFenEval = eval;
+                                        _currentEvalFen = startBoard.ToFen();
+                                        _evalBar.SetEvaluation(eval);
+                                        _computerLines.SetLines(eval, startBoard);
+                                    }
+                                });
+                            }
+                        }
+                        catch { }
+                    });
+                }
+            }
 
             _graphControl.SelectedPly = -1;
             UpdateCapturedPieces(startBoard);
@@ -1322,14 +2345,22 @@ public partial class Form1 : Form
         var board = new BoardState();
         board.LoadFen(move.FenAfter);
 
-        // Sound feedback
-        if (move.San.Contains('x'))
+        bool isAtEnd = plyIndex == _currentGame.Moves.Count - 1 && _currentGame.Moves.Count > 0 && _activeVariation.Count == 0;
+
+        MoveClassification? badge = null;
+        if (_currentAnalysis != null && plyIndex < _currentAnalysis.Moves.Count)
         {
-            SoundService.PlayCapture();
+            badge = _currentAnalysis.Moves[plyIndex].Classification;
         }
-        else
+
+        // Sound feedback
+        if (isAtEnd && !string.IsNullOrWhiteSpace(_currentGame.Result) && _currentGame.Result != "*")
         {
-            SoundService.PlayMove();
+            SoundService.PlayGameEnd();
+        }
+        else if (badge != MoveClassification.Brilliant)
+        {
+            PlayMoveSound(move.Move, board);
         }
 
         // Clock timer display update if available
@@ -1346,41 +2377,127 @@ public partial class Form1 : Form
                 else _lblBottomClock.Text = move.Clock;
             }
         }
-
-        MoveClassification? badge = null;
         if (_currentAnalysis != null && plyIndex < _currentAnalysis.Moves.Count)
         {
             var ma = _currentAnalysis.Moves[plyIndex];
             badge = ma.Classification;
+
+            // Integrity check: if board is in checkmate, ensure post-eval reflects exact mate 0 for winning color
+            bool isDeliveredMate = board.IsInCheck(board.SideToMove) && board.GenerateLegalMoves().Count == 0;
+            if (isDeliveredMate)
+            {
+                ma.PostEval.MateInMoves = 0;
+                ma.PostEval.Centipawns = ma.Color == PieceColor.White ? 100000 : -100000;
+            }
+
+            _currentFenEval = ma.PostEval;
+            _currentEvalFen = board.ToFen();
             _evalBar.SetEvaluation(ma.PostEval);
+            _computerLines.SetLines(ma.PostEval, board);
+
+            bool hasBetter = ma.Classification is MoveClassification.Blunder or MoveClassification.Mistake or MoveClassification.Inaccuracy or MoveClassification.MissedWin;
+            string playedScore = FormatEvalPill(ma.PostEval.Centipawns, ma.PostEval.MateInMoves);
+            string bestScore = FormatEvalPill(ma.PreEval.Centipawns, ma.PreEval.MateInMoves);
+            string bestSan = ma.BestMoveSan;
+
+            var boardBefore = new BoardState();
+            boardBefore.LoadFen(ma.FenBefore);
+            string playedCont = FormatPvLine(ma.PostEval.Pv, board);
+            string bestCont = FormatPvLine(ma.PreEval.Pv, boardBefore);
+
+            _moveReviewCard.Visible = true;
+            _moveReviewCard.SetReview(
+                playedScore,
+                ma.Classification,
+                ma.San,
+                playedCont,
+                hasBetter,
+                bestScore,
+                bestSan,
+                bestCont);
 
             RestoreCurrentPlyArrows();
         }
+        else
+        {
+            _moveReviewCard.Visible = false;
+            _moveReviewCard.Clear();
+            if (!_isAnalyzingGame && _engine != null && _engine.IsRunning)
+            {
+                _variationCts?.Cancel();
+                _variationCts = new CancellationTokenSource();
+                var ct = _variationCts.Token;
+                string fenToAnalyze = board.ToFen();
+                int targetPly = plyIndex;
+                _computerLines.SetStatus("Анализ позиции...");
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var eval = await _engine.AnalyzePositionAsync(fenToAnalyze, depth: _analysisDepth, nodes: 400_000, ct: ct);
+                        if (_currentPlyIndex == targetPly && !_isAnalyzingGame && !ct.IsCancellationRequested)
+                        {
+                            Invoke(() =>
+                            {
+                                if (_currentPlyIndex == targetPly && !_isAnalyzingGame)
+                                {
+                                    _currentFenEval = eval;
+                                    _currentEvalFen = fenToAnalyze;
+                                    _evalBar.SetEvaluation(eval);
+                                    _computerLines.SetLines(eval, board);
+                                }
+                            });
+                        }
+                    }
+                    catch { }
+                });
+            }
+        }
 
+        _boardControl.GameResult = _currentGame.Result;
+        _boardControl.IsAtGameEnd = isAtEnd;
         _boardControl.SetPosition(board, move.Move.From, move.Move.To, badge, animate: true);
+
+        if (isAtEnd)
+        {
+            _boardControl.TriggerGameEndAnimation();
+        }
         _moveHistory.SelectPly(plyIndex);
         _graphControl.SelectedPly = plyIndex;
         UpdateCapturedPieces(board);
+
+        // Update opening badge
+        string? openName = !string.IsNullOrEmpty(_currentGame.Opening)
+            ? _currentGame.Opening
+            : OpeningBook.GetOpeningName(board.ToFen());
+        SetOpeningName(openName);
     }
 
     private void RestoreCurrentPlyArrows()
     {
         _boardControl.ClearArrows();
-        if (_currentAnalysis == null || _currentPlyIndex < 0 || _currentPlyIndex >= _currentAnalysis.Moves.Count) return;
+        if (_currentAnalysis == null || _currentPlyIndex < 0 || _currentPlyIndex >= _currentAnalysis.Moves.Count)
+        {
+            return;
+        }
 
         var ma = _currentAnalysis.Moves[_currentPlyIndex];
-        if (ma.Classification is MoveClassification.Blunder or MoveClassification.Mistake or MoveClassification.Inaccuracy or MoveClassification.MissedWin)
+
+        // 1. Opponent's Threat Arrow (Red)
+        if (_showThreatArrow && ma.ThreatMove.HasValue && !ma.ThreatMove.Value.IsEmpty && ma.ThreatMove.Value.From.IsValid && ma.ThreatMove.Value.To.IsValid)
         {
-            if (ma.ThreatMove.HasValue && !ma.ThreatMove.Value.IsEmpty)
+            if (ma.Classification is MoveClassification.Blunder or MoveClassification.Mistake or MoveClassification.Inaccuracy or MoveClassification.MissedWin)
             {
-                _boardControl.AddArrow(ma.ThreatMove.Value.From, ma.ThreatMove.Value.To, Color.FromArgb(220, 231, 76, 60), width: 7f, hasOutline: true);
+                _boardControl.AddArrow(ma.ThreatMove.Value.From, ma.ThreatMove.Value.To, Color.FromArgb(105, 231, 76, 60), width: 14f, hasOutline: true);
             }
         }
-        else if (ma.Classification is MoveClassification.Brilliant or MoveClassification.Great or MoveClassification.Best)
+
+        // 2. Best Move Arrow (Blue)
+        if (_showBestMoveArrow && ma.BestMove.HasValue && !ma.BestMove.Value.IsEmpty && ma.BestMove.Value.From.IsValid && ma.BestMove.Value.To.IsValid)
         {
-            if (ma.ThreatMove.HasValue && !ma.ThreatMove.Value.IsEmpty)
+            if (ma.BestMove.Value != ma.Move || ma.Classification is MoveClassification.Brilliant or MoveClassification.Great or MoveClassification.Best)
             {
-                _boardControl.AddArrow(ma.ThreatMove.Value.From, ma.ThreatMove.Value.To, Color.FromArgb(200, 129, 182, 76), width: 6.5f, hasOutline: true);
+                _boardControl.AddArrow(ma.BestMove.Value.From, ma.BestMove.Value.To, Color.FromArgb(105, 52, 152, 219), width: 14f, hasOutline: true);
             }
         }
     }
@@ -1401,7 +2518,10 @@ public partial class Form1 : Form
             return;
         }
 
-        _btnQuickAnalyze.Enabled = false;
+        // Cancel any pending reactive position analysis first!
+        _variationCts?.Cancel();
+        _isAnalyzingGame = true;
+
         _progressBar.Visible = true;
         _progressBar.Value = 0;
 
@@ -1413,10 +2533,39 @@ public partial class Form1 : Form
             _progressBar.Value = Math.Clamp((int)p.Percent, 0, 100);
             if (p.LatestAnalyzedMove != null)
             {
-                _graphControl.AddMove(p.LatestAnalyzedMove);
-                if (p.CurrentPly - 1 == _currentPlyIndex)
+                var ma = p.LatestAnalyzedMove;
+                _graphControl.AddMove(ma);
+                _moveHistory.UpdateAnalyzedMove(ma);
+
+                if (_currentPlyIndex == ma.PlyIndex)
                 {
-                    GoToPly(_currentPlyIndex);
+                    _currentFenEval = ma.PostEval;
+                    _currentEvalFen = ma.FenAfter;
+                    var bAfter = new BoardState();
+                    bAfter.LoadFen(ma.FenAfter);
+                    _evalBar.SetEvaluation(ma.PostEval);
+                    _computerLines.SetLines(ma.PostEval, bAfter);
+
+                    string playedScore = FormatEvalPill(ma.PostEval.Centipawns, ma.PostEval.MateInMoves);
+                    string bestScore = FormatEvalPill(ma.PreEval.Centipawns, ma.PreEval.MateInMoves);
+                    var bBefore = new BoardState();
+                    bBefore.LoadFen(ma.FenBefore);
+                    string playedCont = FormatPvLine(ma.PostEval.Pv, bAfter);
+                    string bestCont = FormatPvLine(ma.PreEval.Pv, bBefore);
+                    bool hasBetter = ma.Classification is MoveClassification.Blunder or MoveClassification.Mistake or MoveClassification.Inaccuracy or MoveClassification.MissedWin;
+
+                    _moveReviewCard.SetReview(
+                        playedScore,
+                        ma.Classification,
+                        ma.San,
+                        playedCont,
+                        hasBetter,
+                        bestScore,
+                        ma.BestMoveSan,
+                        bestCont);
+
+                    _boardControl.LastMoveBadge = ma.Classification;
+                    RestoreCurrentPlyArrows();
                 }
             }
         });
@@ -1425,7 +2574,7 @@ public partial class Form1 : Form
         {
             _graphControl.Clear();
 
-            var analysis = await _analysisService.AnalyzeGameAsync(_currentGame, depth, progress, _analysisCts.Token);
+            var analysis = await _analysisService.AnalyzeGameAsync(_currentGame, depth: _analysisDepth, nodes: _analysisNodes, progress: progress, ct: _analysisCts.Token);
             _currentAnalysis = analysis;
 
             // Update UI with complete review
@@ -1434,12 +2583,16 @@ public partial class Form1 : Form
             _lblWhiteElo.Text = analysis.WhiteEstimatedElo.ToString();
             _lblBlackElo.Text = analysis.BlackEstimatedElo.ToString();
 
+            _moveHistory.EnableCallouts = true;
             _moveHistory.SetMoves(analysis.Moves);
             _graphControl.SetMoves(analysis.Moves);
+            _moveReviewCard.Visible = true;
 
             UpdateBadgeCountLabels(analysis);
+            UpdatePhasesData(analysis);
 
-            GoToPly(_currentPlyIndex >= 0 ? _currentPlyIndex : 0);
+            _isAnalyzingGame = false;
+            GoToPly(_currentPlyIndex >= 0 ? _currentPlyIndex : 0, forceRefresh: true);
         }
         catch (OperationCanceledException)
         {
@@ -1451,7 +2604,7 @@ public partial class Form1 : Form
         }
         finally
         {
-            _btnQuickAnalyze.Enabled = true;
+            _isAnalyzingGame = false;
             _progressBar.Visible = false;
             _analysisCts?.Dispose();
             _analysisCts = null;
@@ -1467,7 +2620,7 @@ public partial class Form1 : Form
             {
                 int countW = analysis.WhiteBadgeCounts[c];
                 lblW.Text = countW.ToString();
-                lblW.ForeColor = countW > 0 ? Color.FromArgb(240, 240, 240) : Color.FromArgb(120, 118, 115);
+                lblW.ForeColor = c.GetThemeColor();
             }
 
             var controlsB = _tableBadges.Controls.Find($"badge_b_{c}", true);
@@ -1475,7 +2628,7 @@ public partial class Form1 : Form
             {
                 int countB = analysis.BlackBadgeCounts[c];
                 lblB.Text = countB.ToString();
-                lblB.ForeColor = countB > 0 ? Color.FromArgb(240, 240, 240) : Color.FromArgb(120, 118, 115);
+                lblB.ForeColor = c.GetThemeColor();
             }
         }
     }
@@ -1507,30 +2660,46 @@ public partial class Form1 : Form
 
     private void CopyPgnToClipboard()
     {
-        if (!string.IsNullOrWhiteSpace(_rawPgnText))
+        string pgn = !string.IsNullOrWhiteSpace(_rawPgnText)
+            ? _rawPgnText
+            : (_currentGame.Moves.Count > 0 ? _currentGame.ToPgn(_currentAnalysis) : string.Empty);
+
+        if (!string.IsNullOrWhiteSpace(pgn))
         {
-            Clipboard.SetText(_rawPgnText);
+            Clipboard.SetText(pgn);
             MessageBox.Show("Текст партии (PGN) скопирован в буфер обмена.", "PGN скопирован", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
         else
         {
-            MessageBox.Show("Партия ещё не загружена.", "Информация", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show("Партия ещё не сыграна и не загружена.", "Информация", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
     }
 
     private void BrowseEngineFile()
     {
-        using var ofd = new OpenFileDialog
+        _settings = AppSettings.Load();
+        using var setupDlg = new StockfishSetupDialog(_settings);
+        if (setupDlg.ShowDialog(this) == DialogResult.OK)
         {
-            Filter = "Executable Files (*.exe)|*.exe|All Files (*.*)|*.*",
-            Title = "Укажите файл stockfish.exe"
-        };
-        if (ofd.ShowDialog(this) == DialogResult.OK)
-        {
-            _engine?.Dispose();
-            _engine = new StockfishEngine(ofd.FileName);
-            _analysisService = new AnalysisService(_engine);
-            MessageBox.Show($"Движок успешно подключён:\n{Path.GetFileName(ofd.FileName)}", "Stockfish", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            _settings = AppSettings.Load();
+            if (!string.IsNullOrEmpty(_settings.StockfishPath) && File.Exists(_settings.StockfishPath))
+            {
+                _engine?.Dispose();
+                _engine = new StockfishEngine(_settings.StockfishPath);
+                _analysisService = new AnalysisService(_engine);
+                _computerLines.LineCount = _settings.MultiPv;
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await _engine.StartAsync(threads: _settings.Threads);
+                        await _engine.SetMultiPvAsync(_settings.MultiPv);
+                    }
+                    catch { }
+                });
+                MessageBox.Show($"Движок успешно подключён:\n{Path.GetFileName(_settings.StockfishPath)}", "Stockfish", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                TriggerStartupAnalysis();
+            }
         }
     }
 
@@ -1557,7 +2726,7 @@ public partial class Form1 : Form
         }
         else
         {
-            _btnAutoPlay.Text = "⏸";
+            _btnAutoPlay.IconType = ButtonIconType.Pause;
             _btnAutoPlay.NormalColor = ChessTheme.AccentBlue;
             _autoPlayTimer.Start();
         }
@@ -1566,39 +2735,168 @@ public partial class Form1 : Form
     private void StopAutoPlay()
     {
         _autoPlayTimer.Stop();
-        _btnAutoPlay.Text = "▶";
+        _btnAutoPlay.IconType = ButtonIconType.Play;
         _btnAutoPlay.NormalColor = Color.FromArgb(48, 46, 43);
     }
 
     private async void OnBoardMovePlayed(Move move)
     {
-        var curBoard = _boardControl.Board;
-        bool isCapture = !curBoard[move.To].IsEmpty || (move.To == curBoard.EnPassantSquare && curBoard[move.From].Type == PieceType.Pawn);
-
-        if (isCapture)
+        string fenBefore = _boardControl.LastFenBefore;
+        if (string.IsNullOrEmpty(fenBefore))
         {
-            SoundService.PlayCapture();
-        }
-        else
-        {
-            SoundService.PlayMove();
+            fenBefore = _boardControl.Board.ToFen();
         }
 
-        string fenBefore = curBoard.ToFen();
+        var boardBefore = new BoardState();
+        boardBefore.LoadFen(fenBefore);
+
+        var newBoard = _boardControl.Board;
+        string fenAfter = newBoard.ToFen();
+
+        PlayMoveSound(move, newBoard);
+        UpdateCapturedPieces(newBoard);
+
+        // Clear stale badges from previous game plies on exploratory moves
+        _boardControl.LastMoveBadge = null;
+        _boardControl.IsAtGameEnd = false;
+
         string uci = move.ToUci();
         string san = AnalysisService.ConvertUciToSan(fenBefore, uci);
         if (string.IsNullOrEmpty(san)) san = uci;
 
-        var newBoard = curBoard.Clone();
-        newBoard.ApplyMove(move);
-        _boardControl.SetPosition(newBoard, move.From, move.To, null);
-        UpdateCapturedPieces(newBoard);
+        if (_currentAnalysis == null)
+        {
+            // FIRST SCREEN (Live Play Mode):
+            // If stepped backward, all subsequent moves simply disappear
+            if (_currentPlyIndex < _currentGame.Moves.Count - 1)
+            {
+                int removeStart = _currentPlyIndex + 1;
+                _currentGame.Moves.RemoveRange(removeStart, _currentGame.Moves.Count - removeStart);
+                _moveHistory.TruncateAfter(_currentPlyIndex);
+            }
 
-        _variationMoves.Add(san);
-        _moveHistory.SetVariation(_currentPlyIndex, _variationMoves);
+            _activeVariation.Clear();
+            _activeVariationIndex = -1;
+            _variationBranchPly = -1;
+            _moveHistory.ClearVariation();
+            _pnlVariationBox.Visible = false;
+            _moveReviewCard.Visible = false;
 
-        _pnlVariationBanner.Visible = true;
-        _lblVariationTitle.Text = $"Вариант: {string.Join(" ", _variationMoves)}";
+            var pgnMove = new PgnMove
+            {
+                MoveNumber = (_currentGame.Moves.Count / 2) + 1,
+                Color = boardBefore.SideToMove,
+                San = san,
+                Move = move,
+                FenBefore = fenBefore,
+                FenAfter = fenAfter
+            };
+            _currentGame.Moves.Add(pgnMove);
+
+            var ma = new MoveAnalysis
+            {
+                PlyIndex = _currentGame.Moves.Count - 1,
+                MoveNumber = pgnMove.MoveNumber,
+                Color = pgnMove.Color,
+                San = pgnMove.San,
+                Move = pgnMove.Move,
+                FenBefore = pgnMove.FenBefore,
+                FenAfter = pgnMove.FenAfter,
+                Classification = MoveClassification.Book
+            };
+
+            _moveHistory.AddMove(ma);
+            _currentPlyIndex = _currentGame.Moves.Count - 1;
+            _moveHistory.SelectPly(_currentPlyIndex);
+            _rawPgnText = _currentGame.ToPgn();
+        }
+        else
+        {
+            // SECOND SCREEN (Analyzed Game Exploration Mode):
+            bool isAtEndOfGame = (_activeVariation.Count == 0 && (_currentGame.Moves.Count == 0 || _currentPlyIndex >= _currentGame.Moves.Count - 1));
+
+            if (isAtEndOfGame)
+            {
+                var pgnMove = new PgnMove
+                {
+                    MoveNumber = (_currentGame.Moves.Count / 2) + 1,
+                    Color = boardBefore.SideToMove,
+                    San = san,
+                    Move = move,
+                    FenBefore = fenBefore,
+                    FenAfter = fenAfter
+                };
+                _currentGame.Moves.Add(pgnMove);
+
+                var ma = new MoveAnalysis
+                {
+                    PlyIndex = _currentGame.Moves.Count - 1,
+                    MoveNumber = pgnMove.MoveNumber,
+                    Color = pgnMove.Color,
+                    San = pgnMove.San,
+                    Move = pgnMove.Move,
+                    FenBefore = pgnMove.FenBefore,
+                    FenAfter = pgnMove.FenAfter,
+                    Classification = MoveClassification.Book
+                };
+
+                _moveHistory.AddMove(ma);
+                _currentPlyIndex = _currentGame.Moves.Count - 1;
+                _moveHistory.SelectPly(_currentPlyIndex);
+                _rawPgnText = _currentGame.ToPgn();
+            }
+            else if (_activeVariation.Count == 0 && _currentPlyIndex < _currentGame.Moves.Count - 1 &&
+                     _currentGame.Moves[_currentPlyIndex + 1].Move == move)
+            {
+                GoToPly(_currentPlyIndex + 1);
+                return;
+            }
+            else
+            {
+                if (_activeVariation.Count == 0 || _activeVariationIndex < 0)
+                {
+                    _variationBranchPly = _currentPlyIndex;
+                    _activeVariation.Clear();
+                    _activeVariation.Add(new VariationStep
+                    {
+                        Move = move,
+                        San = san,
+                        FenBefore = fenBefore,
+                        FenAfter = fenAfter
+                    });
+                    _activeVariationIndex = 0;
+                }
+                else
+                {
+                    if (_activeVariationIndex + 1 < _activeVariation.Count)
+                    {
+                        _activeVariation.RemoveRange(_activeVariationIndex + 1, _activeVariation.Count - (_activeVariationIndex + 1));
+                    }
+                    _activeVariation.Add(new VariationStep
+                    {
+                        Move = move,
+                        San = san,
+                        FenBefore = fenBefore,
+                        FenAfter = fenAfter
+                    });
+                    _activeVariationIndex = _activeVariation.Count - 1;
+                }
+
+                _moveHistory.SetVariation(_variationBranchPly, _activeVariation.Select(v => v.San));
+                UpdateVariationBoxUi();
+            }
+        }
+
+        string? op = OpeningBook.GetOpeningName(fenAfter);
+        if (!string.IsNullOrEmpty(op))
+        {
+            _lastBookOpeningName = op;
+            SetOpeningName(op);
+        }
+        else if (!string.IsNullOrEmpty(_lastBookOpeningName))
+        {
+            SetOpeningName(_lastBookOpeningName);
+        }
 
         _variationCts?.Cancel();
         _variationCts = new CancellationTokenSource();
@@ -1606,62 +2904,187 @@ public partial class Form1 : Form
 
         if (_engine == null || !_engine.IsRunning) return;
 
-        try
+        // Show thinking animation on Move Review Card only if in analyzed review mode
+        if (_currentAnalysis != null)
         {
-            var preEval = await _engine.AnalyzePositionAsync(fenBefore, depth: null, nodes: 600000, ct: ct);
-            if (ct.IsCancellationRequested) return;
-
-            var postEval = await _engine.AnalyzePositionAsync(newBoard.ToFen(), depth: null, nodes: 600000, ct: ct);
-            if (ct.IsCancellationRequested) return;
-
-            bool isTop = string.Equals(uci, preEval.BestMoveUci, StringComparison.OrdinalIgnoreCase);
-
-            double preWin = curBoard.SideToMove == PieceColor.White ? preEval.WinProbabilityWhite : (100.0 - preEval.WinProbabilityWhite);
-            double postWin = curBoard.SideToMove == PieceColor.White ? postEval.WinProbabilityWhite : (100.0 - postEval.WinProbabilityWhite);
-            double deltaP = Math.Max(0.0, preWin - postWin);
-
-            MoveClassification classification;
-            if (isTop || deltaP < 1.0) classification = MoveClassification.Best;
-            else if (deltaP <= 5.0) classification = MoveClassification.Excellent;
-            else if (deltaP <= 10.0) classification = MoveClassification.Good;
-            else if (deltaP <= 20.0) classification = MoveClassification.Inaccuracy;
-            else if (deltaP <= 30.0) classification = MoveClassification.Mistake;
-            else classification = MoveClassification.Blunder;
-
-            _evalBar.SetEvaluation(postEval);
-            _boardControl.SetPosition(newBoard, move.From, move.To, classification);
-
-            _boardControl.ClearArrows();
-            if (!string.IsNullOrEmpty(postEval.BestMoveUci))
-            {
-                var bm = Core.Chess.Move.FromUci(postEval.BestMoveUci);
-                if (!bm.IsEmpty)
-                {
-                    _boardControl.AddArrow(bm.From, bm.To, Color.FromArgb(200, 129, 182, 76), width: 7f, hasOutline: true);
-                }
-            }
-        }
-        catch (OperationCanceledException) { }
-        catch
-        {
-            // Ignored
-        }
-    }
-
-    private void ExitVariation()
-    {
-        _variationCts?.Cancel();
-        _variationMoves.Clear();
-        _pnlVariationBanner.Visible = false;
-        _moveHistory.ClearVariation();
-        if (_currentGame.Moves.Count > 0 && _currentPlyIndex >= 0 && _currentPlyIndex < _currentGame.Moves.Count)
-        {
-            GoToPly(_currentPlyIndex);
+            _moveReviewCard.Visible = true;
+            _moveReviewCard.ShowCalculating();
         }
         else
         {
-            GoToPly(-1);
+            _moveReviewCard.Visible = false;
         }
+        _computerLines.SetStatus("Анализ позиции...");
+
+        try
+        {
+            EngineEvaluation preEval;
+            if (_currentFenEval != null && _currentEvalFen == fenBefore)
+            {
+                preEval = _currentFenEval;
+            }
+            else
+            {
+                preEval = await _engine.AnalyzePositionAsync(fenBefore, depth: _analysisDepth, nodes: 400_000, ct: ct);
+            }
+
+            var postEval = await _engine.AnalyzePositionAsync(fenAfter, depth: _analysisDepth, nodes: 600_000, ct: ct);
+            if (ct.IsCancellationRequested) return;
+
+            _currentFenEval = postEval;
+            _currentEvalFen = fenAfter;
+
+            if (_currentAnalysis != null)
+            {
+                bool isTopMove = string.Equals(uci, preEval.BestMoveUci, StringComparison.OrdinalIgnoreCase);
+
+                double preWinWhite = preEval.WinProbabilityWhite;
+                double postWinWhite = postEval.WinProbabilityWhite;
+                PieceColor moveColor = boardBefore.SideToMove;
+                double deltaP = isTopMove
+                    ? 0.0
+                    : (moveColor == PieceColor.White
+                        ? Math.Max(0.0, preWinWhite - postWinWhite)
+                        : Math.Max(0.0, (100.0 - preWinWhite) - (100.0 - postWinWhite)));
+
+                int moveNum = (_currentPlyIndex >= 0 ? (_currentPlyIndex / 2) + 1 : 1) + (_activeVariationIndex / 2);
+                int? userRating = moveColor == PieceColor.White
+                    ? (int.TryParse(_currentGame.WhiteElo, out int wr) ? wr : null)
+                    : (int.TryParse(_currentGame.BlackElo, out int br) ? br : null);
+                var classification = AnalysisService.ClassifySingleMove(move, san, moveColor, moveNum, fenBefore, fenAfter, preEval, postEval, playerRating: userRating);
+                if (isTopMove && classification is MoveClassification.Blunder or MoveClassification.Mistake or MoveClassification.Inaccuracy)
+                {
+                    classification = MoveClassification.Best;
+                }
+
+                if (_activeVariationIndex >= 0 && _activeVariationIndex < _activeVariation.Count)
+                {
+                    _activeVariation[_activeVariationIndex].Classification = classification;
+                    _activeVariation[_activeVariationIndex].PreEval = preEval;
+                    _activeVariation[_activeVariationIndex].PostEval = postEval;
+                }
+
+                _boardControl.LastMoveBadge = classification;
+
+                string playedScore = FormatEvalPill(postEval.Centipawns, postEval.MateInMoves);
+                string bestScore = FormatEvalPill(preEval.Centipawns, preEval.MateInMoves);
+                string bestMoveSan = !string.IsNullOrEmpty(preEval.BestMoveUci)
+                    ? AnalysisService.ConvertUciToSan(fenBefore, preEval.BestMoveUci)
+                    : "";
+
+                bool hasBetter = classification is MoveClassification.Blunder or MoveClassification.Mistake or MoveClassification.Inaccuracy or MoveClassification.MissedWin;
+
+                string playedCont = FormatPvLine(postEval.Pv, newBoard);
+                string bestCont = FormatPvLine(preEval.Pv, boardBefore);
+
+                _moveReviewCard.Visible = true;
+                _moveReviewCard.SetReview(
+                    playedScore,
+                    classification,
+                    san,
+                    playedCont,
+                    hasBetter,
+                    bestScore,
+                    bestMoveSan,
+                    bestCont);
+            }
+            else
+            {
+                _moveReviewCard.Visible = false;
+                _boardControl.LastMoveBadge = null;
+            }
+
+            _evalBar.SetEvaluation(postEval);
+            _computerLines.SetLines(postEval, newBoard);
+
+            _boardControl.ClearArrows();
+        }
+        catch (OperationCanceledException) { }
+        catch { }
+    }
+
+    private void OnCalloutCardClicked(int plyIndex)
+    {
+        OnCalloutTokenClicked(plyIndex, 0);
+    }
+
+    private void OnCalloutTokenClicked(int plyIndex, int tokenIndex)
+    {
+        if (_currentAnalysis == null || plyIndex < 0 || plyIndex >= _currentAnalysis.Moves.Count) return;
+
+        _boardControl.IsAtGameEnd = false;
+
+        // If this variation is ALREADY active for this ply, jump directly to step without reloading
+        if (_variationBranchPly == plyIndex - 1 && _activeVariation.Count > 0)
+        {
+            int targetIdx = Math.Clamp(tokenIndex, 0, _activeVariation.Count - 1);
+            _activeVariationIndex = targetIdx;
+            DisplayVariationStep(targetIdx);
+            UpdateVariationBoxUi();
+            return;
+        }
+
+        var ma = _currentAnalysis.Moves[plyIndex];
+        var pv = ma.PreEval.Pv.Count > 0
+            ? ma.PreEval.Pv
+            : (!string.IsNullOrEmpty(ma.PreEval.BestMoveUci)
+                ? new List<string> { ma.PreEval.BestMoveUci }
+                : (ma.BestMove.HasValue && !ma.BestMove.Value.IsEmpty ? new List<string> { ma.BestMove.Value.ToUci() } : new List<string>()));
+        if (pv.Count == 0) return;
+
+        var board = new BoardState();
+        board.LoadFen(ma.FenBefore);
+
+        _activeVariation.Clear();
+        _variationBranchPly = plyIndex - 1;
+
+        int totalPvMoves = Math.Min(8, pv.Count);
+        for (int k = 0; k < totalPvMoves; k++)
+        {
+            string uci = pv[k];
+            var mv = Core.Chess.Move.FromUci(uci);
+            if (mv.IsEmpty) break;
+
+            string fenBefore = board.ToFen();
+            string san = AnalysisService.ConvertUciToSan(fenBefore, uci);
+            if (string.IsNullOrEmpty(san)) san = uci;
+
+            // Generate full legal move with IsCapture, IsCastling, IsEnPassant flags
+            var legalMoves = board.GenerateLegalMoves();
+            var matchedLegalMove = legalMoves.FirstOrDefault(m => m.From == mv.From && m.To == mv.To && m.Promotion == mv.Promotion);
+            if (!matchedLegalMove.IsEmpty)
+            {
+                mv = matchedLegalMove;
+            }
+            else
+            {
+                bool isCap = san.Contains('x') || !board[mv.To].IsEmpty || (mv.To == board.EnPassantSquare && board[mv.From].Type == PieceType.Pawn);
+                bool isCastle = board[mv.From].Type == PieceType.King && Math.Abs(mv.From.File - mv.To.File) >= 2;
+                bool isEp = mv.To == board.EnPassantSquare && board[mv.From].Type == PieceType.Pawn;
+                mv = new Move(mv.From, mv.To, mv.Promotion, isCap, isCastle, isEp);
+            }
+
+            board.ApplyMove(mv);
+            string fenAfter = board.ToFen();
+
+            _activeVariation.Add(new VariationStep
+            {
+                Move = mv,
+                San = san,
+                FenBefore = fenBefore,
+                FenAfter = fenAfter,
+                Classification = (k == 0) ? MoveClassification.Best : null
+            });
+        }
+
+        if (_activeVariation.Count == 0) return;
+
+        _activeVariationIndex = Math.Clamp(tokenIndex, 0, _activeVariation.Count - 1);
+        _currentPlyIndex = plyIndex - 1;
+
+        _moveHistory.SetVariation(_variationBranchPly, _activeVariation.Select(v => v.San));
+        UpdateVariationBoxUi();
+        DisplayVariationStep(_activeVariationIndex);
     }
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
@@ -1669,16 +3092,24 @@ public partial class Form1 : Form
         switch (keyData)
         {
             case Keys.Left:
-                GoToPly(_currentPlyIndex - 1);
+                if (_activeVariation.Count == 0 && _currentPlyIndex <= -1)
+                {
+                    return true;
+                }
+                StepBackward();
                 return true;
             case Keys.Right:
-                GoToPly(_currentPlyIndex + 1);
+                if (_activeVariation.Count == 0 && (_currentGame.Moves.Count == 0 || _currentPlyIndex >= _currentGame.Moves.Count - 1))
+                {
+                    return true;
+                }
+                StepForward();
                 return true;
             case Keys.Home:
-                GoToPly(-1);
+                GoToFirst();
                 return true;
             case Keys.End:
-                GoToPly(_currentGame.Moves.Count - 1);
+                GoToLast();
                 return true;
             case Keys.F:
                 ToggleBoardFlip();
@@ -1687,7 +3118,7 @@ public partial class Form1 : Form
                 ToggleAutoPlay();
                 return true;
             case Keys.Escape:
-                if (_variationMoves.Count > 0)
+                if (_activeVariation.Count > 0)
                 {
                     ExitVariation();
                     return true;

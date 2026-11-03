@@ -393,6 +393,140 @@ public class BoardState
         return minVal;
     }
 
+    /// <summary>
+    /// Возвращает список полей, с которых фигуры указанного цвета атакуют заданную клетку sq.
+    /// </summary>
+    public List<Square> GetAttackingSquares(Square sq, PieceColor attackingColor)
+    {
+        var list = new List<Square>(4);
+        if (!sq.IsValid) return list;
+
+        // Pawns
+        int pawnRankDir = attackingColor == PieceColor.White ? -1 : 1;
+        int attackRank = sq.Rank + pawnRankDir;
+        if (attackRank is >= 0 and < 8)
+        {
+            if (sq.File > 0 && _squares[attackRank * 8 + (sq.File - 1)] is { Type: PieceType.Pawn } p1 && p1.Color == attackingColor)
+                list.Add(new Square(sq.File - 1, attackRank));
+            if (sq.File < 7 && _squares[attackRank * 8 + (sq.File + 1)] is { Type: PieceType.Pawn } p2 && p2.Color == attackingColor)
+                list.Add(new Square(sq.File + 1, attackRank));
+        }
+
+        // Knights
+        int[] knightOffsets = { -17, -15, -10, -6, 6, 10, 15, 17 };
+        foreach (int off in knightOffsets)
+        {
+            int targetIdx = sq.Index + off;
+            if (targetIdx is >= 0 and < 64)
+            {
+                int df = Math.Abs((targetIdx % 8) - sq.File);
+                int dr = Math.Abs((targetIdx / 8) - sq.Rank);
+                if (df * dr == 2 && _squares[targetIdx] is { Type: PieceType.Knight } pk && pk.Color == attackingColor)
+                {
+                    list.Add(new Square(targetIdx));
+                }
+            }
+        }
+
+        // Bishop / Queen rays
+        (int df, int dr)[] diagDirs = { (1, 1), (1, -1), (-1, 1), (-1, -1) };
+        foreach (var (df, dr) in diagDirs)
+        {
+            int f = sq.File + df;
+            int r = sq.Rank + dr;
+            while (f is >= 0 and < 8 && r is >= 0 and < 8)
+            {
+                var p = _squares[r * 8 + f];
+                if (!p.IsEmpty)
+                {
+                    if (p.Color == attackingColor && (p.Type == PieceType.Bishop || p.Type == PieceType.Queen))
+                        list.Add(new Square(f, r));
+                    break;
+                }
+                f += df;
+                r += dr;
+            }
+        }
+
+        // Rook / Queen rays
+        (int df, int dr)[] straightDirs = { (1, 0), (-1, 0), (0, 1), (0, -1) };
+        foreach (var (df, dr) in straightDirs)
+        {
+            int f = sq.File + df;
+            int r = sq.Rank + dr;
+            while (f is >= 0 and < 8 && r is >= 0 and < 8)
+            {
+                var p = _squares[r * 8 + f];
+                if (!p.IsEmpty)
+                {
+                    if (p.Color == attackingColor && (p.Type == PieceType.Rook || p.Type == PieceType.Queen))
+                        list.Add(new Square(f, r));
+                    break;
+                }
+                f += df;
+                r += dr;
+            }
+        }
+
+        return list;
+    }
+
+    /// <summary>
+    /// Проверяет, атакует ли фигура, находящаяся на attackerSq, поле targetSq.
+    /// </summary>
+    public bool IsSquareAttackedBy(Square targetSq, Square attackerSq)
+    {
+        if (!targetSq.IsValid || !attackerSq.IsValid) return false;
+        var p = _squares[attackerSq.Index];
+        if (p.IsEmpty) return false;
+
+        int df = Math.Abs(targetSq.File - attackerSq.File);
+        int dr = Math.Abs(targetSq.Rank - attackerSq.Rank);
+
+        switch (p.Type)
+        {
+            case PieceType.Pawn:
+                int pawnForward = p.Color == PieceColor.White ? 1 : -1;
+                return (targetSq.Rank - attackerSq.Rank == pawnForward) && (df == 1);
+
+            case PieceType.Knight:
+                return df * dr == 2;
+
+            case PieceType.King:
+                return df <= 1 && dr <= 1 && (df != 0 || dr != 0);
+
+            case PieceType.Bishop:
+                if (df != dr || df == 0) return false;
+                return IsRayClear(attackerSq, targetSq);
+
+            case PieceType.Rook:
+                if (df != 0 && dr != 0) return false;
+                return IsRayClear(attackerSq, targetSq);
+
+            case PieceType.Queen:
+                if (df != dr && df != 0 && dr != 0) return false;
+                return IsRayClear(attackerSq, targetSq);
+
+            default:
+                return false;
+        }
+    }
+
+    private bool IsRayClear(Square from, Square to)
+    {
+        int stepF = Math.Sign(to.File - from.File);
+        int stepR = Math.Sign(to.Rank - from.Rank);
+        int f = from.File + stepF;
+        int r = from.Rank + stepR;
+        while (f != to.File || r != to.Rank)
+        {
+            if (!_squares[r * 8 + f].IsEmpty) return false;
+            f += stepF;
+            r += stepR;
+        }
+        return true;
+    }
+
     public bool IsInCheck(PieceColor color)
     {
         var kingSquare = FindKing(color);
@@ -400,6 +534,9 @@ public class BoardState
         var enemy = color == PieceColor.White ? PieceColor.Black : PieceColor.White;
         return IsSquareAttacked(kingSquare, enemy);
     }
+
+    public bool IsCheckmate() => IsInCheck(SideToMove) && GenerateLegalMoves().Count == 0;
+    public bool IsStalemate() => !IsInCheck(SideToMove) && GenerateLegalMoves().Count == 0;
 
     public List<Move> GenerateLegalMoves()
     {
@@ -742,17 +879,18 @@ public class BoardState
         if (string.IsNullOrWhiteSpace(san)) return Move.Empty;
 
         // Clean checks, mates, annotations
-        string clean = san.Trim().TrimEnd('+', '#', '!', '?', ' ');
+        string clean = san.Trim().TrimEnd('+', '#', '!', '?', ' ').Replace('–', '-').Replace('—', '-');
 
         var legalMoves = GenerateLegalMoves();
 
-        // 1. Castling
-        if (clean == "O-O" || clean == "0-0")
+        // 1. Castling (handles ASCII O-O, digit 0-0, and Cyrillic О-О)
+        string normCastling = clean.Replace('\u041E', 'O').Replace('\u043E', 'O').Replace('0', 'O');
+        if (normCastling == "O-O")
         {
             int rank = SideToMove == PieceColor.White ? 0 : 7;
             return legalMoves.FirstOrDefault(m => m.IsCastling && m.To.File == 6 && m.To.Rank == rank);
         }
-        if (clean == "O-O-O" || clean == "0-0-0")
+        if (normCastling == "O-O-O")
         {
             int rank = SideToMove == PieceColor.White ? 0 : 7;
             return legalMoves.FirstOrDefault(m => m.IsCastling && m.To.File == 2 && m.To.Rank == rank);

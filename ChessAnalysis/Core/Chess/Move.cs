@@ -10,7 +10,7 @@ public readonly record struct Move(
 {
     public static readonly Move Empty = new(Square.None, Square.None);
 
-    public bool IsEmpty => !From.IsValid || !To.IsValid;
+    public bool IsEmpty => !From.IsValid || !To.IsValid || (From == To && !IsCastling) || From == Square.None || To == Square.None;
 
     public string ToUci()
     {

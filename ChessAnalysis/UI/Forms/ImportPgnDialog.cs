@@ -58,25 +58,31 @@ public class ImportPgnDialog : Form
             Font = new Font("Consolas", 9.5f),
             Text = initialPgn ?? string.Empty
         };
+        _txtPgn.KeyDown += (s, e) =>
+        {
+            if (e.Control && e.KeyCode == Keys.A)
+            {
+                _txtPgn.SelectAll();
+                e.SuppressKeyPress = true;
+            }
+        };
         centerPanel.Controls.Add(_txtPgn);
 
         var bottomPanel = new Panel
         {
             Dock = DockStyle.Bottom,
-            Height = 60,
-            Padding = new Padding(16, 10, 16, 12),
+            Height = 56,
             BackColor = ChessTheme.PanelDark
         };
 
         _btnOpenFile = new RoundedButton
         {
             Text = "📂 Открыть файл...",
-            Width = 150,
-            Height = 38,
+            Width = 160,
+            Height = 36,
             BorderRadius = 6,
             NormalColor = Color.FromArgb(48, 46, 43),
             HoverColor = Color.FromArgb(62, 60, 56),
-            Dock = DockStyle.Left,
             Font = new Font("Segoe UI", 9f, FontStyle.Bold)
         };
         _btnOpenFile.Click += (s, e) => OpenFileDialog();
@@ -84,28 +90,25 @@ public class ImportPgnDialog : Form
         _btnCancel = new RoundedButton
         {
             Text = "Отмена",
-            Width = 100,
-            Height = 38,
+            Width = 95,
+            Height = 36,
             BorderRadius = 6,
             NormalColor = Color.FromArgb(48, 46, 43),
             HoverColor = Color.FromArgb(62, 60, 56),
-            Dock = DockStyle.Right,
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-            Margin = new Padding(8, 0, 0, 0)
+            Font = new Font("Segoe UI", 9f, FontStyle.Bold)
         };
         _btnCancel.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
 
         _btnImport = new RoundedButton
         {
             Text = "✔ Загрузить",
-            Width = 130,
-            Height = 38,
+            Width = 140,
+            Height = 36,
             BorderRadius = 6,
             NormalColor = ChessTheme.AccentGreen,
             HoverColor = ChessTheme.AccentGreenHover,
             PressedColor = Color.FromArgb(100, 150, 55),
-            Dock = DockStyle.Right,
-            Font = new Font("Segoe UI", 10f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
             ForeColor = Color.White
         };
         _btnImport.Click += (s, e) =>
@@ -119,23 +122,25 @@ public class ImportPgnDialog : Form
             Close();
         };
 
-        var flowRight = new FlowLayoutPanel
+        void LayoutBottomButtons()
         {
-            Dock = DockStyle.Right,
-            AutoSize = true,
-            FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = false,
-            BackColor = Color.Transparent
-        };
-        flowRight.Controls.Add(_btnImport);
-        flowRight.Controls.Add(_btnCancel);
+            _btnCancel.Location = new Point(bottomPanel.ClientSize.Width - _btnCancel.Width - 16, 10);
+            _btnImport.Location = new Point(_btnCancel.Left - _btnImport.Width - 10, 10);
+            _btnOpenFile.Location = new Point(16, 10);
+        }
 
-        bottomPanel.Controls.Add(flowRight);
+        bottomPanel.Resize += (s, e) => LayoutBottomButtons();
         bottomPanel.Controls.Add(_btnOpenFile);
+        bottomPanel.Controls.Add(_btnImport);
+        bottomPanel.Controls.Add(_btnCancel);
+        LayoutBottomButtons();
 
         Controls.Add(centerPanel);
-        Controls.Add(bottomPanel);
         Controls.Add(topPanel);
+        Controls.Add(bottomPanel);
+
+        AcceptButton = _btnImport;
+        CancelButton = _btnCancel;
     }
 
     private void OpenFileDialog()

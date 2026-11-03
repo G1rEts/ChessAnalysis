@@ -26,7 +26,7 @@ public class EvalBarControl : Control
             true);
 
         BackColor = ChessTheme.BackgroundDark;
-        Width = 36;
+        Width = 40;
 
         _animTimer = new System.Windows.Forms.Timer { Interval = 16 };
         _animTimer.Tick += (s, e) =>
@@ -52,6 +52,10 @@ public class EvalBarControl : Control
 
         // Calculate win probability percent (0..100)
         _targetWhitePercent = eval.WinProbabilityWhite;
+        if (_isMate)
+        {
+            _currentWhitePercent = _targetWhitePercent;
+        }
         _animTimer.Start();
         Invalidate();
     }
@@ -77,8 +81,10 @@ public class EvalBarControl : Control
 
         var barRect = new Rectangle(1, 1, w, h);
 
-        // White height in pixels
-        double pct = Math.Clamp(_currentWhitePercent / 100.0, 0.02, 0.98);
+        // White height in pixels (if mate in moves: 100% solid fill without any sliver)
+        double pct = _isMate
+            ? (_targetWhitePercent >= 50.0 ? 1.0 : 0.0)
+            : Math.Clamp(_currentWhitePercent / 100.0, 0.02, 0.98);
         int whiteHeight = (int)(h * pct);
         int blackHeight = h - whiteHeight;
 
@@ -119,8 +125,19 @@ public class EvalBarControl : Control
         using var borderPen = new Pen(Color.FromArgb(75, 73, 70), 1.2f);
         g.DrawPath(borderPen, clipPath);
 
-        // Draw Evaluation Text (9.5pt Bold, legible on the winning side)
-        using var font = new Font("Segoe UI", 9.5f, FontStyle.Bold);
+        string displayStr = _evalText.TrimStart('+', '-');
+        if (displayStr.Contains('M', StringComparison.OrdinalIgnoreCase))
+        {
+            displayStr = "M" + displayStr.TrimStart('M', 'm', '+', '-');
+        }
+        else if (double.TryParse(displayStr, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double scoreVal))
+        {
+            displayStr = Math.Abs(scoreVal).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        // Draw Evaluation Text (Dynamically scaled: 8pt for M11/-10.5, 8.8pt for standard)
+        float fontSize = displayStr.Length >= 3 ? 8.0f : 8.8f;
+        using var font = new Font("Segoe UI", fontSize, FontStyle.Bold);
         using var sf = new StringFormat
         {
             Alignment = StringAlignment.Center,
@@ -132,15 +149,10 @@ public class EvalBarControl : Control
         using var textBrush = new SolidBrush(textColor);
 
         int textY = whiteAdvantage
-            ? (!IsFlipped ? h - 28 : 6)
-            : (!IsFlipped ? 6 : h - 28);
+            ? (!IsFlipped ? h - 26 : 5)
+            : (!IsFlipped ? 5 : h - 26);
 
-        var textRect = new Rectangle(barRect.X, textY, w, 22);
-        string displayStr = _evalText;
-        if (displayStr.StartsWith("+"))
-        {
-            displayStr = displayStr[1..];
-        }
+        var textRect = new Rectangle(barRect.X, textY, w, 20);
         g.DrawString(displayStr, font, textBrush, textRect, sf);
     }
 

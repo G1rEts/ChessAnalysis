@@ -25,15 +25,29 @@ public class MoveAnalysis
     public Move? BestMove { get; set; }
     public Move? ThreatMove { get; set; }
     public string OpponentThreatSan { get; set; } = string.Empty;
+    public string ThreatSan => OpponentThreatSan;
     public string CoachComment { get; set; } = string.Empty;
+    public string CoachCommentary => CoachComment;
 
     public string ScoreDisplay => PostEval.ScoreDisplay;
+}
+
+public class GamePhaseAnalysis
+{
+    public MoveClassification OpeningPerformance { get; set; } = MoveClassification.Good;
+    public double OpeningAccuracy { get; set; } = 100.0;
+
+    public MoveClassification MiddlegamePerformance { get; set; } = MoveClassification.Good;
+    public double MiddlegameAccuracy { get; set; } = 100.0;
+
+    public MoveClassification? EndgamePerformance { get; set; } // null if not reached ('-')
+    public double? EndgameAccuracy { get; set; }
 }
 
 public class GameAnalysis
 {
     public PgnGame Game { get; set; } = new();
-    public List<MoveAnalysis> Moves { get; } = new();
+    public List<MoveAnalysis> Moves { get; } = [];
 
     public double WhiteAccuracy { get; set; }
     public double BlackAccuracy { get; set; }
@@ -41,8 +55,11 @@ public class GameAnalysis
     public int WhiteEstimatedElo { get; set; } = 800;
     public int BlackEstimatedElo { get; set; } = 800;
 
-    public Dictionary<MoveClassification, int> WhiteBadgeCounts { get; } = new();
-    public Dictionary<MoveClassification, int> BlackBadgeCounts { get; } = new();
+    public GamePhaseAnalysis WhitePhases { get; set; } = new();
+    public GamePhaseAnalysis BlackPhases { get; set; } = new();
+
+    public Dictionary<MoveClassification, int> WhiteBadgeCounts { get; } = [];
+    public Dictionary<MoveClassification, int> BlackBadgeCounts { get; } = [];
 
     public GameAnalysis()
     {

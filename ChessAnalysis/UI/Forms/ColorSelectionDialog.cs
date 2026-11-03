@@ -13,7 +13,7 @@ public class ColorSelectionDialog : Form
     public ColorSelectionDialog(string whitePlayer, string? whiteElo, string blackPlayer, string? blackElo)
     {
         Text = "Выбор стороны партии";
-        Size = new Size(520, 310);
+        Size = new Size(520, 230);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
@@ -29,17 +29,17 @@ public class ColorSelectionDialog : Form
             Font = new Font("Segoe UI", 13.5f, FontStyle.Bold),
             ForeColor = Color.White,
             Dock = DockStyle.Top,
-            Height = 50,
+            Height = 44,
             TextAlign = ContentAlignment.MiddleCenter
         };
 
         var lblSubtitle = new Label
         {
-            Text = "Анализ ошибок и предупреждений будет сфокусирован на вашей игре",
+            Text = "Анализ ошибок и вариантов будет сфокусирован на вашей игре",
             Font = new Font("Segoe UI", 9f),
             ForeColor = ChessTheme.TextSecondary,
             Dock = DockStyle.Top,
-            Height = 24,
+            Height = 22,
             TextAlign = ContentAlignment.MiddleCenter
         };
 
@@ -47,7 +47,7 @@ public class ColorSelectionDialog : Form
         var pnlButtons = new Panel
         {
             Dock = DockStyle.Fill,
-            Padding = new Padding(24, 16, 24, 16)
+            Padding = new Padding(24, 8, 24, 16)
         };
 
         string wText = string.IsNullOrWhiteSpace(whitePlayer) ? "Белые" : whitePlayer;
@@ -66,8 +66,8 @@ public class ColorSelectionDialog : Form
                 DialogResult = DialogResult.OK;
                 Close();
             });
-        btnWhite.Location = new Point(24, 20);
-        btnWhite.Size = new Size(215, 110);
+        btnWhite.Location = new Point(24, 12);
+        btnWhite.Size = new Size(220, 105);
 
         var btnBlack = CreateColorButton(
             title: "♚ Черные",
@@ -79,45 +79,15 @@ public class ColorSelectionDialog : Form
                 DialogResult = DialogResult.OK;
                 Close();
             });
-        btnBlack.Location = new Point(265, 20);
-        btnBlack.Size = new Size(215, 110);
+        btnBlack.Location = new Point(260, 12);
+        btnBlack.Size = new Size(220, 105);
 
         pnlButtons.Controls.Add(btnWhite);
         pnlButtons.Controls.Add(btnBlack);
 
-        // Bottom skip / cancel panel
-        var bottomPanel = new Panel
-        {
-            Dock = DockStyle.Bottom,
-            Height = 46,
-            BackColor = ChessTheme.PanelDark
-        };
-
-        var btnSkip = new RoundedButton
-        {
-            Text = "Оставить нейтральный вид (Белые снизу)",
-            Width = 280,
-            Height = 30,
-            BorderRadius = 5,
-            NormalColor = Color.FromArgb(48, 46, 43),
-            HoverColor = Color.FromArgb(62, 60, 56),
-            Font = new Font("Segoe UI", 8.5f),
-            ForeColor = ChessTheme.TextSecondary,
-            Dock = DockStyle.None,
-            Location = new Point((520 - 280) / 2, 8)
-        };
-        btnSkip.Click += (s, e) =>
-        {
-            SelectedColor = PieceColor.White;
-            DialogResult = DialogResult.OK;
-            Close();
-        };
-        bottomPanel.Controls.Add(btnSkip);
-
         Controls.Add(pnlButtons);
         Controls.Add(lblSubtitle);
         Controls.Add(lblTitle);
-        Controls.Add(bottomPanel);
     }
 
     private Control CreateColorButton(string title, string playerInfo, bool isWhitePiece, Action onClick)
@@ -132,56 +102,50 @@ public class ColorSelectionDialog : Form
         btn.MouseEnter += (s, e) => { hovered = true; btn.Invalidate(); };
         btn.MouseLeave += (s, e) => { hovered = false; btn.Invalidate(); };
         btn.Click += (s, e) => onClick();
+        btn.MouseUp += (s, e) => { if (e.Button == MouseButtons.Left) onClick(); };
 
         btn.Paint += (s, e) =>
         {
-            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+
             var rect = new Rectangle(0, 0, btn.Width - 1, btn.Height - 1);
             using var path = CreateRoundedRectanglePath(rect, 10);
 
             Color bgColor = hovered ? Color.FromArgb(58, 56, 52) : ChessTheme.PanelDark;
             using var bgBrush = new SolidBrush(bgColor);
-            e.Graphics.FillPath(bgBrush, path);
+            g.FillPath(bgBrush, path);
 
             Color borderColor = hovered ? ChessTheme.AccentGreen : ChessTheme.BorderColor;
             using var borderPen = new Pen(borderColor, hovered ? 2f : 1.2f);
-            e.Graphics.DrawPath(borderPen, path);
+            g.DrawPath(borderPen, path);
 
-            // Draw Piece Icon if available
+            // Draw Piece Icon
             var img = ResourceManager.GetPieceImage(isWhitePiece ? PieceColor.White : PieceColor.Black, PieceType.King);
             if (img != null)
             {
-                e.Graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                e.Graphics.DrawImage(img, new Rectangle(16, 25, 48, 48));
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.DrawImage(img, new Rectangle(14, 25, 48, 48));
             }
-        };
 
-        var lblBtnTitle = new Label
-        {
-            Text = title,
-            Font = new Font("Segoe UI", 12f, FontStyle.Bold),
-            ForeColor = Color.White,
-            Location = new Point(72, 22),
-            Size = new Size(135, 26),
-            BackColor = Color.Transparent,
-            Cursor = Cursors.Hand
-        };
-        lblBtnTitle.Click += (s, e) => onClick();
+            // Draw Title (Bold)
+            using var titleFont = new Font("Segoe UI", 12f, FontStyle.Bold);
+            using var titleBrush = new SolidBrush(Color.White);
+            var titleRect = new RectangleF(68, 18, btn.Width - 74, 28);
+            g.DrawString(title, titleFont, titleBrush, titleRect);
 
-        var lblPlayer = new Label
-        {
-            Text = playerInfo,
-            Font = new Font("Segoe UI", 9f),
-            ForeColor = ChessTheme.TextSecondary,
-            Location = new Point(72, 52),
-            Size = new Size(135, 48),
-            BackColor = Color.Transparent,
-            Cursor = Cursors.Hand
+            // Draw Player Info
+            using var playerFont = new Font("Segoe UI", 9f);
+            using var playerBrush = new SolidBrush(ChessTheme.TextSecondary);
+            using var sf = new StringFormat
+            {
+                Trimming = StringTrimming.EllipsisWord,
+                FormatFlags = StringFormatFlags.LineLimit
+            };
+            var playerRect = new RectangleF(68, 48, btn.Width - 74, 50);
+            g.DrawString(playerInfo, playerFont, playerBrush, playerRect, sf);
         };
-        lblPlayer.Click += (s, e) => onClick();
-
-        btn.Controls.Add(lblBtnTitle);
-        btn.Controls.Add(lblPlayer);
 
         return btn;
     }

@@ -1,4 +1,9 @@
+using System;
+using System.IO;
+using System.Windows.Forms;
 using ChessAnalysis.Core.Analysis;
+using ChessAnalysis.Core.Config;
+using ChessAnalysis.UI.Forms;
 
 namespace ChessAnalysis
 {
@@ -17,7 +22,22 @@ namespace ChessAnalysis
             }
 
             ApplicationConfiguration.Initialize();
-            Application.Run(new Form1());
+
+            var settings = AppSettings.Load();
+            bool needSetup = !settings.IsSetupCompleted ||
+                             string.IsNullOrWhiteSpace(settings.StockfishPath) ||
+                             !File.Exists(settings.StockfishPath);
+
+            if (needSetup)
+            {
+                using var setupDlg = new StockfishSetupDialog(settings);
+                if (setupDlg.ShowDialog() != DialogResult.OK)
+                {
+                    return;
+                }
+            }
+
+            Application.Run(new Form1(settings.StockfishPath));
         }
 
         static void RunSelfTest()

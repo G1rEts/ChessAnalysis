@@ -11,9 +11,11 @@ public class DownloadGameDialog : Form
     private readonly ComboBox _comboPlatform;
     private readonly RoundedButton _btnSearch;
     private readonly ListBox _listGames;
+    private readonly RoundedButton _btnLoadMore;
     private readonly RoundedButton _btnSelect;
     private readonly RoundedButton _btnCancel;
     private readonly Label _lblStatus;
+    private readonly Panel _bottomPanel;
     private readonly GameDownloadService _downloadService = new();
 
     private List<DownloadedGameSummary> _games = new();
@@ -23,8 +25,8 @@ public class DownloadGameDialog : Form
     public DownloadGameDialog()
     {
         Text = "Скачать партии по никнейму (Chess.com / Lichess)";
-        Size = new Size(680, 500);
-        MinimumSize = new Size(540, 400);
+        Size = new Size(860, 530);
+        MinimumSize = new Size(750, 420);
         StartPosition = FormStartPosition.CenterParent;
         BackColor = ChessTheme.BackgroundDark;
         ForeColor = ChessTheme.TextPrimary;
@@ -115,7 +117,7 @@ public class DownloadGameDialog : Form
         _listGames.DoubleClick += (s, e) => SelectGame();
 
         // Bottom Panel
-        var bottomPanel = new Panel
+        _bottomPanel = new Panel
         {
             Dock = DockStyle.Bottom,
             Height = 55,
@@ -126,45 +128,76 @@ public class DownloadGameDialog : Form
         _lblStatus = new Label
         {
             Text = "Введите ник и нажмите «Найти партии»",
-            Location = new Point(12, 16),
-            AutoSize = true,
+            Location = new Point(12, 10),
+            Size = new Size(240, 35),
+            AutoSize = false,
+            AutoEllipsis = true,
+            TextAlign = ContentAlignment.MiddleLeft,
             ForeColor = ChessTheme.TextSecondary
         };
 
-        _btnSelect = new RoundedButton
+        _btnLoadMore = new RoundedButton
         {
-            Text = "Открыть для анализа",
-            Anchor = AnchorStyles.Right | AnchorStyles.Top,
-            Location = new Point(bottomPanel.Width - 280, 10),
-            Width = 160,
+            Text = "📥 Догрузить 25 партий",
+            Width = 190,
             Height = 34,
             BorderRadius = 6,
-            NormalColor = ChessTheme.AccentGreen,
-            HoverColor = ChessTheme.AccentGreenHover,
-            Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
-            Enabled = false
+            NormalColor = Color.FromArgb(48, 46, 43),
+            HoverColor = Color.FromArgb(62, 60, 56),
+            CustomBorderColor = Color.FromArgb(75, 73, 68),
+            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+            Visible = false
         };
-        _btnSelect.Click += (s, e) => SelectGame();
+        _btnLoadMore.Click += async (s, e) => await LoadMoreGamesAsync();
 
         _btnCancel = new RoundedButton
         {
             Text = "Отмена",
-            Anchor = AnchorStyles.Right | AnchorStyles.Top,
-            Location = new Point(bottomPanel.Width - 110, 10),
             Width = 90,
             Height = 34,
             BorderRadius = 6,
             NormalColor = Color.FromArgb(48, 46, 43),
             HoverColor = Color.FromArgb(62, 60, 56),
-            Font = new Font("Segoe UI", 9.5f, FontStyle.Regular)
+            Font = new Font("Segoe UI", 9f, FontStyle.Regular)
         };
         _btnCancel.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
 
-        bottomPanel.Controls.AddRange(new Control[] { _lblStatus, _btnSelect, _btnCancel });
+        _btnSelect = new RoundedButton
+        {
+            Text = "Открыть для анализа",
+            Width = 230,
+            Height = 34,
+            BorderRadius = 6,
+            NormalColor = ChessTheme.AccentGreen,
+            HoverColor = ChessTheme.AccentGreenHover,
+            Font = new Font("Segoe UI", 9.2f, FontStyle.Bold),
+            Enabled = false
+        };
+        _btnSelect.Click += (s, e) => SelectGame();
+
+        _bottomPanel.Resize += (s, e) => LayoutBottomButtons();
+
+        _bottomPanel.Controls.Add(_lblStatus);
+        _bottomPanel.Controls.Add(_btnLoadMore);
+        _bottomPanel.Controls.Add(_btnSelect);
+        _bottomPanel.Controls.Add(_btnCancel);
+        _btnLoadMore.BringToFront();
+        _btnSelect.BringToFront();
+        _btnCancel.BringToFront();
+        LayoutBottomButtons();
 
         Controls.Add(_listGames);
         Controls.Add(topPanel);
-        Controls.Add(bottomPanel);
+        Controls.Add(_bottomPanel);
+    }
+
+    private void LayoutBottomButtons()
+    {
+        _btnCancel.Location = new Point(_bottomPanel.ClientSize.Width - _btnCancel.Width - 16, 10);
+        _btnSelect.Location = new Point(_btnCancel.Left - _btnSelect.Width - 10, 10);
+        _btnLoadMore.Location = new Point(_btnSelect.Left - _btnLoadMore.Width - 10, 10);
+        int maxStatusW = (_btnLoadMore.Visible ? _btnLoadMore.Left : _btnSelect.Left) - 24;
+        _lblStatus.Width = Math.Max(50, maxStatusW);
     }
 
     private async Task SearchGamesAsync()
@@ -172,8 +205,8 @@ public class DownloadGameDialog : Form
         string username = _txtUsername.Text.Trim();
         if (string.IsNullOrEmpty(username))
         {
-            MessageBox.Show("Пожалуйста, введите никнейм.", "Внимание", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
+            username = "G1rEts";
+            _txtUsername.Text = "G1rEts";
         }
 
         _btnSearch.Enabled = false;
@@ -197,6 +230,7 @@ public class DownloadGameDialog : Form
             if (_games.Count == 0)
             {
                 _lblStatus.Text = $"Партий для '{username}' не найдено.";
+                _btnLoadMore.Visible = false;
             }
             else
             {
@@ -207,6 +241,8 @@ public class DownloadGameDialog : Form
                 }
                 _listGames.SelectedIndex = 0;
                 _btnSelect.Enabled = true;
+                _btnLoadMore.Visible = true;
+                _btnLoadMore.Enabled = true;
             }
         }
         catch (Exception ex)
@@ -217,6 +253,59 @@ public class DownloadGameDialog : Form
         finally
         {
             _btnSearch.Enabled = true;
+            _btnLoadMore.BringToFront();
+            LayoutBottomButtons();
+        }
+    }
+
+    private async Task LoadMoreGamesAsync()
+    {
+        string username = _txtUsername.Text.Trim();
+        if (string.IsNullOrEmpty(username)) return;
+
+        _btnLoadMore.Enabled = false;
+        _lblStatus.Text = "Загрузка следующей порции партий...";
+
+        try
+        {
+            bool isChessCom = _comboPlatform.SelectedIndex == 0;
+            int skip = _games.Count;
+            List<DownloadedGameSummary> moreGames;
+            if (isChessCom)
+            {
+                moreGames = await _downloadService.FetchChessComGamesAsync(username, 25, skip: skip);
+            }
+            else
+            {
+                moreGames = await _downloadService.FetchLichessGamesAsync(username, 25, skip: skip);
+            }
+
+            if (moreGames.Count == 0)
+            {
+                _lblStatus.Text = $"Все партии загружены (всего: {_games.Count}).";
+                _btnLoadMore.Visible = false;
+            }
+            else
+            {
+                _games.AddRange(moreGames);
+                foreach (var g in moreGames)
+                {
+                    _listGames.Items.Add(g.DisplayTitle);
+                }
+                _lblStatus.Text = $"Загружено партий: {_games.Count}. Выберите нужную.";
+                _btnLoadMore.Visible = true;
+                _btnLoadMore.Enabled = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            _lblStatus.Text = "Ошибка: " + ex.Message;
+        }
+        finally
+        {
+            _btnLoadMore.BringToFront();
+            LayoutBottomButtons();
+            if (_btnLoadMore.Visible) _btnLoadMore.Enabled = true;
         }
     }
 

@@ -32,7 +32,10 @@ public class GameDownloadService
         _httpClient.Timeout = TimeSpan.FromSeconds(15);
     }
 
-    public async Task<List<DownloadedGameSummary>> FetchChessComGamesAsync(string username, int maxCount = 20)
+    public Task<List<DownloadedGameSummary>> GetRecentGamesAsync(string username, int maxCount = 25)
+        => FetchChessComGamesAsync(username, maxCount);
+
+    public async Task<List<DownloadedGameSummary>> FetchChessComGamesAsync(string username, int maxCount = 25, int skip = 0)
     {
         var list = new List<DownloadedGameSummary>();
         if (string.IsNullOrWhiteSpace(username)) return list;
@@ -59,6 +62,8 @@ public class GameDownloadService
             .Where(x => !string.IsNullOrEmpty(x))
             .ToList();
 
+        int totalSeen = 0;
+
         // Iterate recent archives backwards
         for (int a = archiveUrls.Count - 1; a >= 0 && list.Count < maxCount; a--)
         {
@@ -75,10 +80,11 @@ public class GameDownloadService
             var gamesList = gamesEl.EnumerateArray().Reverse().ToList();
             foreach (var g in gamesList)
             {
-                if (list.Count >= maxCount) break;
-
                 string pgn = g.TryGetProperty("pgn", out var pgnEl) ? (pgnEl.GetString() ?? "") : "";
                 if (string.IsNullOrWhiteSpace(pgn)) continue;
+
+                totalSeen++;
+                if (totalSeen <= skip) continue;
 
                 string whiteUser = "";
                 string whiteRating = "";
@@ -126,19 +132,22 @@ public class GameDownloadService
                     TimeControl = timeControl,
                     PgnText = pgn
                 });
+
+                if (list.Count >= maxCount) break;
             }
         }
 
         return list;
     }
 
-    public async Task<List<DownloadedGameSummary>> FetchLichessGamesAsync(string username, int maxCount = 20)
+    public async Task<List<DownloadedGameSummary>> FetchLichessGamesAsync(string username, int maxCount = 25, int skip = 0)
     {
         var list = new List<DownloadedGameSummary>();
         if (string.IsNullOrWhiteSpace(username)) return list;
 
         string cleanUser = username.Trim();
-        string url = $"https://lichess.org/api/games/user/{cleanUser}?max={maxCount}&pgnInBody=true&clocks=false&evals=false";
+        int fetchTotal = maxCount + skip;
+        string url = $"https://lichess.org/api/games/user/{cleanUser}?max={fetchTotal}&perfType=ultraBullet,bullet,blitz,rapid,classical,correspondence&pgnInBody=true&clocks=false&evals=false";
 
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         request.Headers.Accept.Clear();
@@ -153,7 +162,8 @@ public class GameDownloadService
         string rawPgn = await response.Content.ReadAsStringAsync();
         var parsedGames = PgnParser.ParseGames(rawPgn);
 
-        foreach (var g in parsedGames)
+        var batch = parsedGames.Where(g => !g.Headers.TryGetValue("Variant", out var v) || v is "Standard" or "").Skip(skip).Take(maxCount);
+        foreach (var g in batch)
         {
             list.Add(new DownloadedGameSummary
             {
@@ -165,7 +175,7 @@ public class GameDownloadService
                 Result = g.Result,
                 Date = g.Date,
                 TimeControl = g.TimeControl,
-                PgnText = FormatSingleGamePgn(g)
+                PgnText = !string.IsNullOrWhiteSpace(g.RawPgn) ? g.RawPgn : FormatSingleGamePgn(g)
             });
         }
 

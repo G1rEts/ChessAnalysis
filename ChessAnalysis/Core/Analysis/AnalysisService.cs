@@ -12,23 +12,22 @@ public class AnalysisProgress
     public MoveAnalysis? LatestAnalyzedMove { get; set; }
 }
 
-public class AnalysisService
+public class AnalysisService(StockfishEngine engine)
 {
-    private readonly StockfishEngine _engine;
-
-    public AnalysisService(StockfishEngine engine)
-    {
-        _engine = engine;
-    }
+    private readonly StockfishEngine _engine = engine;
 
     public async Task<GameAnalysis> AnalyzeGameAsync(
         PgnGame game,
-        int depth = 14,
+        int? depth = null,
+        long? nodes = 400000,
         IProgress<AnalysisProgress>? progress = null,
         CancellationToken ct = default)
     {
         var gameAnalysis = new GameAnalysis { Game = game };
         if (game.Moves.Count == 0) return gameAnalysis;
+
+        int? wRating = int.TryParse(game.WhiteElo, out int wr) && wr > 0 ? wr : null;
+        int? bRating = int.TryParse(game.BlackElo, out int br) && br > 0 ? br : null;
 
         await _engine.NewGameAsync();
 
@@ -40,6 +39,11 @@ public class AnalysisService
 
             var pgnMove = game.Moves[i];
 
+            if (string.IsNullOrWhiteSpace(pgnMove.FenBefore))
+            {
+                pgnMove.FenBefore = BoardState.StartingFen;
+            }
+
             // 1. Evaluate Pre-Move Position
             EngineEvaluation preEval;
             if (cachedPreEval != null)
@@ -48,11 +52,32 @@ public class AnalysisService
             }
             else
             {
-                preEval = await _engine.AnalyzePositionAsync(pgnMove.FenBefore, depth: null, nodes: 600000, ct: ct);
+                preEval = await _engine.AnalyzePositionAsync(pgnMove.FenBefore, depth: depth, nodes: nodes, ct: ct);
+            }
+
+            // Guarantee FenAfter is computed if missing
+            if (string.IsNullOrWhiteSpace(pgnMove.FenAfter))
+            {
+                var tempB = new BoardState();
+                tempB.LoadFen(pgnMove.FenBefore);
+                tempB.ApplyMove(pgnMove.Move);
+                pgnMove.FenAfter = tempB.ToFen();
             }
 
             // 2. Evaluate Post-Move Position (reused for next move)
-            var postEval = await _engine.AnalyzePositionAsync(pgnMove.FenAfter, depth: null, nodes: 600000, ct: ct);
+            var postEval = await _engine.AnalyzePositionAsync(pgnMove.FenAfter, depth: depth, nodes: nodes, ct: ct);
+
+            // If the move delivered checkmate, guarantee exact mate 0 evaluation and winning sign
+            var postBoard = new BoardState();
+            postBoard.LoadFen(pgnMove.FenAfter);
+            bool isDeliveredMate = (postBoard.IsInCheck(postBoard.SideToMove) && postBoard.GenerateLegalMoves().Count == 0)
+                || pgnMove.San.EndsWith('#') || pgnMove.San.EndsWith('‡');
+            if (isDeliveredMate)
+            {
+                postEval.MateInMoves = 0;
+                postEval.Centipawns = pgnMove.Color == PieceColor.White ? 100000 : -100000;
+            }
+
             cachedPreEval = postEval; // Can reuse for next move's FenBefore
 
             // 3. Compute Win Probability Loss (Delta P)
@@ -73,33 +98,64 @@ public class AnalysisService
                 deltaP = Math.Max(0.0, preWinBlack - postWinBlack);
             }
 
-            // 4. CAPS Accuracy Formula
-            double accuracy = 100.0;
-            if (deltaP > 0.01)
-            {
-                accuracy = Math.Clamp(103.1668 * Math.Exp(-0.04354 * deltaP) - 3.1669, 0.0, 100.0);
-            }
-
-            // 5. Best Move & Opponent Threat Move
+            // 4. Best Move & Opponent Threat Move
             string bestMoveSan = ConvertUciToSan(pgnMove.FenBefore, preEval.BestMoveUci);
             var bestMove = Move.FromUci(preEval.BestMoveUci);
 
             string threatSan = ConvertUciToSan(pgnMove.FenAfter, postEval.BestMoveUci);
             var threatMove = Move.FromUci(postEval.BestMoveUci);
 
-            // 6. Check if position had only 1 legal move (Forced)
+            // 5. Check if position had only 1 legal move (Forced)
             var boardBefore = new BoardState();
             boardBefore.LoadFen(pgnMove.FenBefore);
             int legalCount = boardBefore.GenerateLegalMoves().Count;
 
-            // 7. Move Classification
-            var classification = ClassifyMove(pgnMove, preEval, postEval, deltaP, legalCount);
+            // 6. Move Classification (с приоритетом аннотации из PGN)
+            int? playerRating = pgnMove.Color == PieceColor.White ? wRating : bRating;
+            var classification = pgnMove.ExpectedClassification ?? ClassifyMove(pgnMove, preEval, postEval, deltaP, legalCount, playerRating);
+
+            // 7. CAPS Accuracy Formula с калибровкой по классификации хода
+            double accuracy = 100.0;
+            if (pgnMove.ExpectedClassification.HasValue)
+            {
+                accuracy = classification switch
+                {
+                    MoveClassification.Brilliant or MoveClassification.Great or MoveClassification.Best or MoveClassification.Book or MoveClassification.Forced => 100.0,
+                    MoveClassification.Excellent => 95.0,
+                    MoveClassification.Good => 85.0,
+                    MoveClassification.Inaccuracy => 68.0,
+                    MoveClassification.Mistake => 48.0,
+                    MoveClassification.MissedWin => 28.0,
+                    MoveClassification.Blunder => 18.0,
+                    _ => 100.0
+                };
+            }
+            else
+            {
+                if (deltaP > 0.01)
+                {
+                    accuracy = Math.Clamp(103.1668 * Math.Exp(-0.04354 * deltaP) - 3.1669, 10.0, 100.0);
+                }
+
+                // Ограничиваем точность ходов по их качеству, чтобы зевки в выигранных/проигранных позициях не получали 80-99%
+                accuracy = classification switch
+                {
+                    MoveClassification.Brilliant or MoveClassification.Great or MoveClassification.Best or MoveClassification.Book or MoveClassification.Forced => Math.Max(accuracy, 97.0),
+                    MoveClassification.Excellent => Math.Clamp(accuracy, 84.0, 94.0),
+                    MoveClassification.Good => Math.Clamp(accuracy, 64.0, 82.0),
+                    MoveClassification.Inaccuracy => Math.Clamp(accuracy, 35.0, 64.0),
+                    MoveClassification.Mistake => Math.Clamp(accuracy, 18.0, 44.0),
+                    MoveClassification.MissedWin => Math.Clamp(accuracy, 12.0, 25.0),
+                    MoveClassification.Blunder => Math.Clamp(accuracy, 2.0, 15.0),
+                    _ => accuracy
+                };
+            }
 
             // 8. Opening Name if in book
             string? openingName = OpeningBook.GetOpeningName(pgnMove.FenAfter);
 
             // 9. Coach Commentary with tactical reason
-            string comment = GenerateCommentary(classification, pgnMove.San, bestMoveSan, threatSan, deltaP, openingName);
+            string comment = GenerateCommentary(classification, pgnMove.San, bestMoveSan, threatSan, openingName);
 
             var moveAnalysis = new MoveAnalysis
             {
@@ -148,35 +204,191 @@ public class AnalysisService
         gameAnalysis.WhiteAccuracy = CalculatePlayerAccuracy(whiteMoves);
         gameAnalysis.BlackAccuracy = CalculatePlayerAccuracy(blackMoves);
 
-        int whiteBlunders = whiteMoves.Count(m => m.Classification is MoveClassification.Blunder or MoveClassification.MissedWin);
+        int whiteBlunders = whiteMoves.Count(m => m.Classification == MoveClassification.Blunder);
         int whiteMistakes = whiteMoves.Count(m => m.Classification == MoveClassification.Mistake);
-        int blackBlunders = blackMoves.Count(m => m.Classification is MoveClassification.Blunder or MoveClassification.MissedWin);
-        int blackMistakes = blackMoves.Count(m => m.Classification == MoveClassification.Mistake);
+        int whiteMissedWins = whiteMoves.Count(m => m.Classification == MoveClassification.MissedWin);
+        int whiteBrilliant = whiteMoves.Count(m => m.Classification == MoveClassification.Brilliant);
+        int whiteGreat = whiteMoves.Count(m => m.Classification == MoveClassification.Great);
 
-        gameAnalysis.WhiteEstimatedElo = EstimatePerformanceElo(gameAnalysis.WhiteAccuracy, whiteBlunders, whiteMistakes);
-        gameAnalysis.BlackEstimatedElo = EstimatePerformanceElo(gameAnalysis.BlackAccuracy, blackBlunders, blackMistakes);
+        int blackBlunders = blackMoves.Count(m => m.Classification == MoveClassification.Blunder);
+        int blackMistakes = blackMoves.Count(m => m.Classification == MoveClassification.Mistake);
+        int blackMissedWins = blackMoves.Count(m => m.Classification == MoveClassification.MissedWin);
+        int blackBrilliant = blackMoves.Count(m => m.Classification == MoveClassification.Brilliant);
+        int blackGreat = blackMoves.Count(m => m.Classification == MoveClassification.Great);
+
+        bool whiteWon = game.Result == "1-0";
+        bool blackWon = game.Result == "0-1";
+
+        gameAnalysis.WhiteEstimatedElo = EstimatePerformanceElo(gameAnalysis.WhiteAccuracy, whiteBlunders, whiteMistakes, wRating, whiteBrilliant, whiteGreat, whiteWon, whiteMissedWins);
+        gameAnalysis.BlackEstimatedElo = EstimatePerformanceElo(gameAnalysis.BlackAccuracy, blackBlunders, blackMistakes, bRating, blackBrilliant, blackGreat, blackWon, blackMissedWins);
+
+        // Compute Phase Analysis (Opening, Middlegame, Endgame)
+        GamePhasesService.CalculatePhases(gameAnalysis);
 
         return gameAnalysis;
+    }
+
+    public static void CalculateGamePhases(GameAnalysis gameAnalysis)
+    {
+        GamePhasesService.CalculatePhases(gameAnalysis);
     }
 
     private static double CalculatePlayerAccuracy(List<MoveAnalysis> moves)
     {
         if (moves.Count == 0) return 100.0;
-        double baseAcc = moves.Average(m => m.MoveAccuracy);
-        int blunders = moves.Count(m => m.Classification is MoveClassification.Blunder or MoveClassification.MissedWin);
-        int mistakes = moves.Count(m => m.Classification == MoveClassification.Mistake);
+        var nonBookMoves = moves.Where(m => m.Classification != MoveClassification.Book).ToList();
+        var evalMoves = nonBookMoves.Count > 0 ? nonBookMoves : moves;
 
-        double penalty = ((blunders * 5.5) + (mistakes * 2.2)) / moves.Count * 22.0;
-        return Math.Round(Math.Clamp(baseAcc - penalty, 15.0, 99.8), 1);
+        double baseAcc = evalMoves.Average(m => m.MoveAccuracy);
+        int blunders = evalMoves.Count(m => m.Classification is MoveClassification.Blunder or MoveClassification.MissedWin);
+        int mistakes = evalMoves.Count(m => m.Classification == MoveClassification.Mistake);
+        int inaccuracies = evalMoves.Count(m => m.Classification == MoveClassification.Inaccuracy);
+
+        double penalty = ((blunders * 7.5) + (mistakes * 3.8) + (inaccuracies * 1.2)) / evalMoves.Count * 20.0;
+        return Math.Round(Math.Clamp(baseAcc - penalty, 10.0, 99.8), 1);
     }
 
-    public static int EstimatePerformanceElo(double accuracy, int blunders, int mistakes)
+    public static int EstimatePerformanceElo(
+        double accuracy,
+        int blunders,
+        int mistakes,
+        int? playerRating = null,
+        int brilliantCount = 0,
+        int greatCount = 0,
+        bool wonGame = false,
+        int missedWins = 0)
     {
-        // Calibrated to Chess.com: 56.1% -> ~350, 67.3% -> ~850, 85% -> ~1500, 95% -> ~2100
-        double elo = (accuracy - 48.0) * 44.0;
-        elo -= (blunders * 40.0) + (mistakes * 15.0);
-        int rounded = (int)(Math.Round(elo / 50.0) * 50);
-        return Math.Clamp(rounded, 150, 2850);
+        // Базовый расчет по точности CAPS с умеренной калибровкой
+        double baseElo;
+        if (accuracy < 55.0)
+        {
+            // Диапазон новичка (200 - 500)
+            baseElo = 200.0 + Math.Max(0.0, accuracy - 45.0) * 28.0;
+        }
+        else if (accuracy < 72.0)
+        {
+            // 55..72% точности: средний (480 -> 900)
+            double t = (accuracy - 55.0) / 17.0;
+            baseElo = 480.0 + t * 420.0;
+        }
+        else if (accuracy < 85.0)
+        {
+            // 72..85% точности: клубный/продвинутый (900 -> 1380)
+            double t = (accuracy - 72.0) / 13.0;
+            baseElo = 900.0 + t * 480.0;
+        }
+        else
+        {
+            // 85..100% точности: мастер / гроссмейстер (1380 -> 2550)
+            double t = (accuracy - 85.0) / 15.0;
+            baseElo = 1380.0 + t * 1100.0;
+        }
+
+        // Корректировка по ошибкам и блестящим ходам
+        double baseMistakePenalty = mistakes * 15.0;
+        if (mistakes >= 6)
+        {
+            baseMistakePenalty += (mistakes - 5) * 15.0;
+        }
+
+        double effectiveMissedPenalty = (blunders > 0 || mistakes > 0 || accuracy < 70.0)
+            ? (missedWins * 25.0)
+            : 0.0;
+
+        double baseBlunderPenalty = (blunders * 38.0) + Math.Max(0, blunders - 2) * 35.0;
+
+        baseElo -= baseBlunderPenalty;
+        baseElo -= effectiveMissedPenalty;
+        baseElo -= baseMistakePenalty;
+        baseElo += (brilliantCount * 50.0);
+        baseElo += (greatCount * 30.0);
+        if (wonGame) baseElo += 40.0;
+        else baseElo -= 40.0;
+
+        // Если в PGN указан рейтинг игрока (WhiteElo / BlackElo),
+        // привязываем оценку к ожидаемому уровню этого игрока (как на Chess.com)
+        if (playerRating.HasValue && playerRating.Value > 0)
+        {
+            double r = playerRating.Value;
+            // Реалистичная ожидаемая точность: ~54% для 250, ~70% для 1200, ~77% для 1800, ~88% для 2500
+            double expectedAcc = Math.Clamp(50.0 + (r / 65.0), 50.0, 92.0);
+            double deltaAcc = accuracy - expectedAcc;
+
+            // Чем выше рейтинг игрока, тем строже штраф за грубые ошибки и зевки
+            double ratingScale = Math.Clamp(r / 1000.0, 0.65, 1.50);
+
+            double blunderPenalty = ((blunders * 40.0) + Math.Max(0, blunders - 2) * 40.0) * ratingScale;
+            double missedPenalty = ((blunders > 0 || mistakes > 0 || accuracy < 70.0)
+                ? (missedWins * 30.0)
+                : 0.0) * ratingScale;
+
+            double mistakePenalty = (mistakes * 14.0) * ratingScale;
+            if (mistakes >= 6)
+            {
+                mistakePenalty += ((mistakes - 5) * 14.0) * ratingScale;
+            }
+
+            double effectiveDeltaAcc = (mistakes >= 6) ? Math.Min(deltaAcc, 8.0) : deltaAcc;
+            // При высоком рейтинге безупречная игра дарит сильный бонус к перформансу (+500 ELO при 88% у 1800)
+            double deltaWeight = r >= 1500 ? 32.0 : 20.0;
+            double playerBasedElo = r + (effectiveDeltaAcc * deltaWeight)
+                                    - blunderPenalty
+                                    - missedPenalty
+                                    - mistakePenalty
+                                    + (brilliantCount * 50.0)
+                                    + (greatCount * 40.0)
+                                    + (wonGame ? 50.0 : 0.0);
+
+            if (blunders == 0 && mistakes == 0 && accuracy >= 70.0)
+            {
+                playerBasedElo += 80.0;
+            }
+
+            baseElo = playerBasedElo;
+        }
+        else
+        {
+            baseElo += 40.0;
+        }
+
+        int rounded = (int)(Math.Round(baseElo / 50.0) * 50);
+        return Math.Clamp(rounded, 100, 2900);
+    }
+
+    public static MoveClassification ClassifySingleMove(
+        Move move,
+        string san,
+        PieceColor color,
+        int moveNumber,
+        string fenBefore,
+        string fenAfter,
+        EngineEvaluation preEval,
+        EngineEvaluation postEval,
+        MoveClassification? expectedClassification = null,
+        int? playerRating = null)
+    {
+        var pgnMove = new PgnMove
+        {
+            Move = move,
+            San = san,
+            Color = color,
+            MoveNumber = moveNumber,
+            FenBefore = fenBefore,
+            FenAfter = fenAfter,
+            ExpectedClassification = expectedClassification
+        };
+
+        double preWinWhite = preEval.WinProbabilityWhite;
+        double postWinWhite = postEval.WinProbabilityWhite;
+        double deltaP = color == PieceColor.White
+            ? Math.Max(0.0, preWinWhite - postWinWhite)
+            : Math.Max(0.0, (100.0 - preWinWhite) - (100.0 - postWinWhite));
+
+        var boardBefore = new BoardState();
+        boardBefore.LoadFen(fenBefore);
+        int legalCount = boardBefore.GenerateLegalMoves().Count;
+
+        return ClassifyMove(pgnMove, preEval, postEval, deltaP, legalCount, playerRating);
     }
 
     private static MoveClassification ClassifyMove(
@@ -184,174 +396,16 @@ public class AnalysisService
         EngineEvaluation preEval,
         EngineEvaluation postEval,
         double deltaP,
-        int legalCount)
+        int legalCount,
+        int? playerRating = null)
     {
-        // 0. Checkmate delivered!
-        if (pgnMove.San.Contains('#') || (postEval.MateInMoves.HasValue && postEval.MateInMoves.Value == 0))
+        // Priority 1: If the move already has an annotated classification or NAG ($1..$6, -G1..-B4), respect it!
+        if (pgnMove.ExpectedClassification.HasValue)
         {
-            return MoveClassification.Best;
+            return pgnMove.ExpectedClassification.Value;
         }
 
-        // 1. Forced move: only 1 legal move in position
-        if (legalCount == 1)
-        {
-            return MoveClassification.Forced;
-        }
-
-        string playedUci = pgnMove.Move.ToUci();
-        bool isTopEngineMove = string.Equals(playedUci, preEval.BestMoveUci, StringComparison.OrdinalIgnoreCase);
-
-        // 2. Opening Book
-        if (pgnMove.MoveNumber <= 15 && OpeningBook.IsBookPosition(pgnMove.FenAfter))
-        {
-            return MoveClassification.Book;
-        }
-
-        // 3. Missed Win: Player had decisive win (>80% win prob or >= +2.5 / mate), but threw it away (loss >= 18%)
-        double playerPreWinProb = pgnMove.Color == PieceColor.White ? preEval.WinProbabilityWhite : (100.0 - preEval.WinProbabilityWhite);
-        double playerPostWinProb = pgnMove.Color == PieceColor.White ? postEval.WinProbabilityWhite : (100.0 - postEval.WinProbabilityWhite);
-        if (playerPreWinProb >= 80.0 && deltaP >= 18.0 && playerPostWinProb <= 65.0)
-        {
-            return MoveClassification.MissedWin;
-        }
-
-        double evalForPlayer = pgnMove.Color == PieceColor.White ? postEval.Centipawns : -postEval.Centipawns;
-        double preEvalForPlayer = pgnMove.Color == PieceColor.White ? preEval.Centipawns : -preEval.Centipawns;
-
-        // 4. Sacrifice classification (Brilliant vs Great)
-        // Per Arslanov Chess:
-        // "Замечательный (!): временная жертва — материал сразу отыгрывается — или верная жертва, которую трудность не сделала блестящей."
-        // "Блестящий (!!): верная жертва материала, которая не отыгрывается немедленно и сохраняет позиционный/тактический перевес."
-        if (isTopEngineMove && preEvalForPlayer <= 500 && (evalForPlayer >= 100 || (postEval.MateInMoves.HasValue && postEval.MateInMoves.Value > 0)))
-        {
-            if (IsSacrifice(pgnMove, out bool isTemporarySacrifice))
-            {
-                if (isTemporarySacrifice)
-                {
-                    // Material is immediately won back or tactical exchange (-3 +5) -> Great (!)
-                    return MoveClassification.Great;
-                }
-                else
-                {
-                    // Real piece sacrifice maintaining advantage -> Brilliant (!!)
-                    return MoveClassification.Brilliant;
-                }
-            }
-        }
-
-        // 5. Great Move (🎯):
-        // Only winning or only saving move in a critical position (second best move is noticeably worse)
-        if (isTopEngineMove && preEval.HasSecondBest)
-        {
-            int scoreDiff = pgnMove.Color == PieceColor.White
-                ? (preEval.Centipawns - preEval.SecondBestCentipawns)
-                : (-preEval.Centipawns - (-preEval.SecondBestCentipawns));
-
-            double secondBestEvalForPlayer = pgnMove.Color == PieceColor.White ? preEval.SecondBestCentipawns : -preEval.SecondBestCentipawns;
-            bool secondBestFails = secondBestEvalForPlayer <= 150 || (scoreDiff >= 200 && preEvalForPlayer <= 500);
-
-            if (secondBestFails && (scoreDiff >= 150 || (preEval.MateInMoves.HasValue && !preEval.SecondBestMateIn.HasValue)))
-            {
-                return MoveClassification.Great;
-            }
-        }
-
-        // 6. Standard thresholds based on win probability loss (Delta P) per Arslanov Chess:
-        if (isTopEngineMove || deltaP < 1.0)
-            return MoveClassification.Best;
-
-        if (deltaP <= 5.0)
-            return MoveClassification.Excellent;
-
-        if (deltaP <= 10.0)
-            return MoveClassification.Good;
-
-        if (deltaP <= 20.0)
-            return MoveClassification.Inaccuracy;
-
-        if (deltaP <= 30.0)
-            return MoveClassification.Mistake;
-
-        return MoveClassification.Blunder;
-    }
-
-    private static bool IsSacrifice(PgnMove pgnMove, out bool isTemporarySacrifice)
-    {
-        isTemporarySacrifice = false;
-
-        var boardBefore = new BoardState();
-        boardBefore.LoadFen(pgnMove.FenBefore);
-
-        var movingColor = pgnMove.Color;
-        var enemyColor = movingColor == PieceColor.White ? PieceColor.Black : PieceColor.White;
-
-        bool wasInCheck = boardBefore.IsInCheck(movingColor);
-        var movedPiece = boardBefore[pgnMove.Move.From];
-
-        // Only major or minor pieces (Knight, Bishop, Rook, Queen) can be sacrificed
-        if (movedPiece.Type is PieceType.Pawn or PieceType.King or PieceType.None)
-            return false;
-
-        int movedPieceVal = movedPiece.Value;
-
-        // If the move is a capture:
-        if (pgnMove.Move.IsCapture)
-        {
-            var capturedPiece = boardBefore[pgnMove.Move.To];
-            // If we captured an equal or more valuable piece (e.g. Knight takes Knight/Rook), this is an equal trade or winning capture, NOT a sacrifice!
-            if (capturedPiece.Value >= movedPieceVal - 50)
-            {
-                return false;
-            }
-
-            // Exchange sacrifice (e.g. Rook takes Bishop/Knight, or Piece takes Pawn):
-            if (movedPieceVal - capturedPiece.Value >= 180)
-            {
-                // If it's a minor piece taking a pawn (e.g. Bxf7+ Kxf7 Ng5+), it's a temporary tactical sacrifice
-                if (movedPiece.Type is PieceType.Bishop or PieceType.Knight && capturedPiece.Type == PieceType.Pawn)
-                {
-                    isTemporarySacrifice = true;
-                }
-                return true;
-            }
-            return false;
-        }
-
-        var boardAfter = new BoardState();
-        boardAfter.LoadFen(pgnMove.FenBefore);
-        boardAfter.ApplyMove(pgnMove.Move);
-
-        // Check if destination square is attacked by enemy
-        bool destAttackedByEnemy = boardAfter.IsSquareAttacked(pgnMove.Move.To, enemyColor);
-        if (!destAttackedByEnemy)
-            return false;
-
-        bool destDefendedByFriendly = boardAfter.IsSquareAttacked(pgnMove.Move.To, movingColor);
-
-        // Interposing a defended piece while in check is basic defense, not a sacrifice
-        if (wasInCheck && destDefendedByFriendly)
-            return false;
-
-        int lowestEnemyAttacker = boardAfter.GetLowestAttackerValue(pgnMove.Move.To, enemyColor);
-
-        // If the enemy can capture our piece with a lesser piece (e.g. Pawn captures Knight, or Minor captures Queen/Rook)
-        if (lowestEnemyAttacker < movedPieceVal)
-        {
-            // If the piece is defended and will be recaptured immediately, check if it's a temporary sacrifice
-            if (destDefendedByFriendly)
-            {
-                isTemporarySacrifice = true;
-            }
-            return true;
-        }
-
-        // If left completely hanging (undefended)
-        if (!destDefendedByFriendly)
-        {
-            return true;
-        }
-
-        return false;
+        return MoveClassifier.Classify(pgnMove, preEval, postEval, deltaP, legalCount, weights: null, playerRating: playerRating);
     }
 
     public static string ConvertUciToSan(string fen, string uci)
@@ -407,7 +461,6 @@ public class AnalysisService
         string playedSan,
         string bestMoveSan,
         string threatSan,
-        double deltaP,
         string? openingName = null) => c switch
     {
         MoveClassification.Brilliant => string.IsNullOrEmpty(threatSan)
@@ -425,7 +478,7 @@ public class AnalysisService
             $"Отличный ход! Ход {playedSan} сохраняет позиционный перевес и практически равен первой линии.",
 
         MoveClassification.Good =>
-            $"Хороший ход. Надежное и прочное продолжение.",
+            $"Неплохой ход. Надежное продолжение.",
 
         MoveClassification.Book => string.IsNullOrEmpty(openingName)
             ? $"Теоретический ход ({playedSan}). Развитие фигур по дебютной теории."

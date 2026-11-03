@@ -7,6 +7,8 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <NoWarn>$(NoWarn);WFO1000</NoWarn>
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
+    <SatelliteResourceLanguages>ru;en</SatelliteResourceLanguages>
   </PropertyGroup>
 
   <ItemGroup>

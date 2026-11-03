@@ -3,3 +3,8 @@ obj/
 .vs/
 *.user
 *.suo
+dist/
+*.apk
+*.pdb
+ChessAnalysis.Mobile/
+scripts/BuildStockfishAndroid.*

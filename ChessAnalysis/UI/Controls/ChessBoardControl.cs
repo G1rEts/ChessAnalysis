@@ -3,11 +3,12 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using ChessAnalysis.Core.Analysis;
 using ChessAnalysis.Core.Chess;
+using ChessAnalysis.UI.Forms;
 using ChessAnalysis.UI.Resources;
 
 namespace ChessAnalysis.UI.Controls;
 
-public readonly record struct BoardArrow(Square From, Square To, Color Color, float Width = 6f, bool HasOutline = false);
+public readonly record struct BoardArrow(Square From, Square To, Color Color, float Width = 14f, bool HasOutline = false);
 
 public class ChessBoardControl : Control
 {
@@ -18,8 +19,15 @@ public class ChessBoardControl : Control
     private MoveClassification? _lastMoveBadge = null;
 
     private Square _selectedSquare = Square.None;
-    private List<Move> _legalMovesFromSelected = new();
-    private readonly List<BoardArrow> _arrows = new();
+    private List<Move> _legalMovesFromSelected = [];
+    private readonly List<BoardArrow> _arrows = [];
+
+    // User interactive drawings (Right Mouse Button: Drag = Arrow, Click = Circle, LMB = Clear)
+    private readonly List<BoardArrow> _userArrows = [];
+    private readonly HashSet<Square> _userCircles = [];
+    private Square _rmbDownSquare = Square.None;
+    private Square _rmbCurrentSquare = Square.None;
+    private bool _isRmbDragging = false;
 
     // Pill Popup Animation ("Сильный ход!" / "Блестящий ход!")
     private bool _pillActive = false;
@@ -28,8 +36,23 @@ public class ChessBoardControl : Control
     private readonly System.Diagnostics.Stopwatch _pillStopwatch = new();
     private readonly System.Windows.Forms.Timer _pillTimer;
 
+    // Mate Badge Animation (0.5s transition from full square to corner)
+    private bool _mateActive = false;
+    private readonly System.Diagnostics.Stopwatch _mateStopwatch = new();
+    private readonly System.Windows.Forms.Timer _mateTimer;
+
+    // Drag and drop state
+    private bool _isDragging = false;
+    private Square _dragSquare = Square.None;
+    private Point _dragPosition = Point.Empty;
+
+    public string LastFenBefore { get; private set; } = string.Empty;
+
     public bool IsFlipped { get; set; } = false;
     public bool Interactive { get; set; } = true;
+
+    public string? GameResult { get; set; }
+    public bool IsAtGameEnd { get; set; } = false;
 
     public List<BoardArrow> Arrows => _arrows;
 
@@ -94,6 +117,32 @@ public class ChessBoardControl : Control
                 _pillTimer.Stop();
             }
         };
+
+        _mateTimer = new System.Windows.Forms.Timer { Interval = 15 };
+        _mateTimer.Tick += (s, e) =>
+        {
+            if (_mateActive)
+            {
+                if (_mateStopwatch.ElapsedMilliseconds > 500)
+                {
+                    _mateActive = false;
+                    _mateTimer.Stop();
+                }
+                Invalidate();
+            }
+            else
+            {
+                _mateTimer.Stop();
+            }
+        };
+    }
+
+    public void TriggerGameEndAnimation()
+    {
+        _mateActive = true;
+        _mateStopwatch.Restart();
+        _mateTimer.Start();
+        Invalidate();
     }
 
     public void SetPosition(BoardState board, Square from = default, Square to = default, MoveClassification? badge = null, bool animate = true)
@@ -119,6 +168,22 @@ public class ChessBoardControl : Control
             _pillTimer.Stop();
         }
 
+        bool isCheckmate = _board.IsInCheck(_board.SideToMove) && _board.GenerateLegalMoves().Count == 0;
+        bool isStalemate = !_board.IsInCheck(_board.SideToMove) && _board.GenerateLegalMoves().Count == 0;
+        bool isGameEnding = isCheckmate || isStalemate || (IsAtGameEnd && !string.IsNullOrWhiteSpace(GameResult) && GameResult != "*");
+
+        if (animate && isGameEnding)
+        {
+            _mateActive = true;
+            _mateStopwatch.Restart();
+            _mateTimer.Start();
+        }
+        else if (!isGameEnding)
+        {
+            _mateActive = false;
+            _mateTimer.Stop();
+        }
+
         Invalidate();
     }
 
@@ -128,7 +193,17 @@ public class ChessBoardControl : Control
         Invalidate();
     }
 
-    public void AddArrow(Square from, Square to, Color color, float width = 6f, bool hasOutline = false)
+    public void ClearUserDrawings()
+    {
+        _userArrows.Clear();
+        _userCircles.Clear();
+        _rmbDownSquare = Square.None;
+        _rmbCurrentSquare = Square.None;
+        _isRmbDragging = false;
+        Invalidate();
+    }
+
+    public void AddArrow(Square from, Square to, Color color, float width = 14f, bool hasOutline = false)
     {
         _arrows.Add(new BoardArrow(from, to, color, width, hasOutline));
         Invalidate();
@@ -186,7 +261,28 @@ public class ChessBoardControl : Control
     protected override void OnMouseDown(MouseEventArgs e)
     {
         base.OnMouseDown(e);
+
+        if (e.Button == MouseButtons.Right)
+        {
+            var sq = PointToSquare(e.Location);
+            if (sq.IsValid)
+            {
+                _rmbDownSquare = sq;
+                _rmbCurrentSquare = sq;
+                _isRmbDragging = false;
+            }
+            return;
+        }
+
         if (e.Button != MouseButtons.Left) return;
+
+        // LMB clears any custom annotations (like Chess.com/Lichess)
+        if (_userArrows.Count > 0 || _userCircles.Count > 0)
+        {
+            _userArrows.Clear();
+            _userCircles.Clear();
+            Invalidate();
+        }
 
         var clickedSq = PointToSquare(e.Location);
         SquareClicked?.Invoke(clickedSq);
@@ -197,36 +293,30 @@ public class ChessBoardControl : Control
         {
             if (clickedSq == _selectedSquare)
             {
-                // Clicking on the selected square deselects it
-                _selectedSquare = Square.None;
-                _legalMovesFromSelected.Clear();
+                // Clicking on the selected square starts drag if held or prepares for drag
+                _isDragging = true;
+                _dragSquare = clickedSq;
+                _dragPosition = e.Location;
                 Invalidate();
                 return;
             }
 
             // Check if clicked square is a target for a legal move
-            var targetMove = _legalMovesFromSelected.FirstOrDefault(m => m.To == clickedSq);
-            if (!targetMove.IsEmpty)
+            Core.Chess.Move targetMove = Core.Chess.Move.Empty;
+            bool isLegalTarget = false;
+            foreach (var m in _legalMovesFromSelected)
             {
-                // Auto promote to Queen if not specified
-                if (targetMove.Promotion != PieceType.None)
+                if (m.To == clickedSq)
                 {
-                    targetMove = targetMove with { Promotion = PieceType.Queen };
+                    targetMove = m;
+                    isLegalTarget = true;
+                    break;
                 }
+            }
 
-                if (targetMove.IsCapture || !_board[targetMove.To].IsEmpty || targetMove.To == _board.EnPassantSquare)
-                {
-                    SoundService.PlayCapture();
-                }
-                else
-                {
-                    SoundService.PlayMove();
-                }
-
-                MovePlayed?.Invoke(targetMove);
-                _selectedSquare = Square.None;
-                _legalMovesFromSelected.Clear();
-                Invalidate();
+            if (isLegalTarget && !targetMove.IsEmpty)
+            {
+                ExecutePlayerMove(targetMove);
                 return;
             }
         }
@@ -236,17 +326,143 @@ public class ChessBoardControl : Control
         if (!piece.IsEmpty && piece.Color == _board.SideToMove)
         {
             _selectedSquare = clickedSq;
-            _legalMovesFromSelected = _board.GenerateLegalMoves()
-                .Where(m => m.From == clickedSq)
-                .ToList();
+            _legalMovesFromSelected = [.. _board.GenerateLegalMoves()
+                .Where(m => m.From == clickedSq)];
+
+            _isDragging = true;
+            _dragSquare = clickedSq;
+            _dragPosition = e.Location;
         }
         else
         {
             _selectedSquare = Square.None;
             _legalMovesFromSelected.Clear();
+            _isDragging = false;
+            _dragSquare = Square.None;
         }
 
         Invalidate();
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+
+        if ((e.Button & MouseButtons.Right) != 0 && _rmbDownSquare.IsValid)
+        {
+            var curSq = PointToSquare(e.Location);
+            if (curSq.IsValid && curSq != _rmbDownSquare)
+            {
+                _isRmbDragging = true;
+                _rmbCurrentSquare = curSq;
+                Invalidate();
+            }
+            return;
+        }
+
+        if (_isDragging && _dragSquare.IsValid)
+        {
+            var boardRect = GetBoardRect();
+            // Restrict dragged piece strictly within board boundaries so it cannot leave the board
+            int clampedX = Math.Clamp(e.X, boardRect.Left, boardRect.Right);
+            int clampedY = Math.Clamp(e.Y, boardRect.Top, boardRect.Bottom);
+            _dragPosition = new Point(clampedX, clampedY);
+            Invalidate();
+        }
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+
+        if (e.Button == MouseButtons.Right)
+        {
+            var dropSq = PointToSquare(e.Location);
+            if (_rmbDownSquare.IsValid)
+            {
+                if (_isRmbDragging && dropSq.IsValid && dropSq != _rmbDownSquare)
+                {
+                    // Toggle custom user arrow
+                    var arrow = new BoardArrow(_rmbDownSquare, dropSq, Color.FromArgb(180, 243, 156, 18), 14f, HasOutline: true);
+                    int idx = _userArrows.FindIndex(a => a.From == _rmbDownSquare && a.To == dropSq);
+                    if (idx >= 0) _userArrows.RemoveAt(idx);
+                    else _userArrows.Add(arrow);
+                }
+                else if (!_isRmbDragging && _rmbDownSquare.IsValid)
+                {
+                    // Toggle custom highlight circle
+                    if (!_userCircles.Remove(_rmbDownSquare))
+                    {
+                        _userCircles.Add(_rmbDownSquare);
+                    }
+                }
+            }
+            _rmbDownSquare = Square.None;
+            _rmbCurrentSquare = Square.None;
+            _isRmbDragging = false;
+            Invalidate();
+            return;
+        }
+
+        if (e.Button != MouseButtons.Left) return;
+
+        if (_isDragging)
+        {
+            _isDragging = false;
+            var dropSq = PointToSquare(e.Location);
+
+            if (dropSq.IsValid && dropSq != _dragSquare && _selectedSquare == _dragSquare)
+            {
+                var targetMove = _legalMovesFromSelected.FirstOrDefault(m => m.To == dropSq);
+                if (!targetMove.IsEmpty)
+                {
+                    ExecutePlayerMove(targetMove);
+                    _dragSquare = Square.None;
+                    Invalidate();
+                    return;
+                }
+            }
+
+            _dragSquare = Square.None;
+            Invalidate();
+        }
+    }
+
+    private void ExecutePlayerMove(Core.Chess.Move targetMove)
+    {
+        // Double verification against legal moves of the board
+        if (_board.GenerateLegalMoves().Any(lm => lm.From == targetMove.From && lm.To == targetMove.To))
+        {
+            bool isCap = targetMove.IsCapture || !_board[targetMove.To].IsEmpty || targetMove.To == _board.EnPassantSquare;
+            var piece = _board[targetMove.From];
+            var promo = PieceType.None;
+            if (targetMove.Promotion != PieceType.None || (piece.Type == PieceType.Pawn && (targetMove.To.Rank == 0 || targetMove.To.Rank == 7)))
+            {
+                using var dlg = new PromotionSelectionDialog(piece.Color);
+                if (dlg.ShowDialog(FindForm()) == DialogResult.OK)
+                {
+                    promo = dlg.SelectedPiece;
+                }
+                else
+                {
+                    promo = PieceType.Queen;
+                }
+            }
+            targetMove = targetMove with { Promotion = promo, IsCapture = isCap };
+
+            _lastMoveFrom = targetMove.From;
+            _lastMoveTo = targetMove.To;
+            _lastMoveBadge = null; // Clear stale badges on manual moves!
+            _selectedSquare = Square.None;
+            _legalMovesFromSelected.Clear();
+            _isDragging = false;
+            _dragSquare = Square.None;
+            LastFenBefore = _board.ToFen();
+            _board.ApplyMove(targetMove);
+            Invalidate();
+
+            MovePlayed?.Invoke(targetMove);
+        }
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -309,7 +525,71 @@ public class ChessBoardControl : Control
             }
         }
 
-        // 3. Draw Legal Move Dots / Capture Rings
+        // King squares highlighting for Checkmate, Resignation & Stalemate
+        bool isCheckmate = _board.IsInCheck(_board.SideToMove) && _board.GenerateLegalMoves().Count == 0;
+        bool isStalemate = !_board.IsInCheck(_board.SideToMove) && _board.GenerateLegalMoves().Count == 0;
+        bool isResignation = IsAtGameEnd && !isCheckmate && !isStalemate && (GameResult is "1-0" or "0-1");
+        bool isPgnDraw = IsAtGameEnd && !isCheckmate && !isStalemate && (GameResult is "1/2-1/2" or "0-0" or "½-½");
+
+        var sideToMove = _board.SideToMove;
+        var enemySide = sideToMove == PieceColor.White ? PieceColor.Black : PieceColor.White;
+        var kingToMoveSq = _board.FindKing(sideToMove);
+        var enemyKingSq = _board.FindKing(enemySide);
+
+        var whiteKingSq = _board.FindKing(PieceColor.White);
+        var blackKingSq = _board.FindKing(PieceColor.Black);
+
+        if (isCheckmate)
+        {
+            // Loser king square: red highlight
+            if (kingToMoveSq.IsValid)
+            {
+                using var loseBrush = new SolidBrush(Color.FromArgb(160, 235, 75, 75));
+                g.FillRectangle(loseBrush, GetSquareRect(kingToMoveSq, boardRect));
+            }
+            // Winner king square: green highlight
+            if (enemyKingSq.IsValid)
+            {
+                using var winBrush = new SolidBrush(Color.FromArgb(160, 129, 182, 76));
+                g.FillRectangle(winBrush, GetSquareRect(enemyKingSq, boardRect));
+            }
+        }
+        else if (isResignation)
+        {
+            var winKing = GameResult == "1-0" ? whiteKingSq : blackKingSq;
+            var loseKing = GameResult == "1-0" ? blackKingSq : whiteKingSq;
+            if (winKing.IsValid)
+            {
+                using var winBrush = new SolidBrush(Color.FromArgb(160, 129, 182, 76));
+                g.FillRectangle(winBrush, GetSquareRect(winKing, boardRect));
+            }
+            if (loseKing.IsValid)
+            {
+                using var loseBrush = new SolidBrush(Color.FromArgb(160, 235, 75, 75));
+                g.FillRectangle(loseBrush, GetSquareRect(loseKing, boardRect));
+            }
+        }
+        else if (isStalemate || isPgnDraw)
+        {
+            // Stalemate / Draw: both king squares 30% black fill
+            using var staleBrush = new SolidBrush(Color.FromArgb(77, 0, 0, 0));
+            if (whiteKingSq.IsValid) g.FillRectangle(staleBrush, GetSquareRect(whiteKingSq, boardRect));
+            if (blackKingSq.IsValid) g.FillRectangle(staleBrush, GetSquareRect(blackKingSq, boardRect));
+        }
+
+        // 3. User Highlight Circles (Right Click)
+        foreach (var cSq in _userCircles)
+        {
+            var cr = GetSquareRect(cSq, boardRect);
+            if (!cr.IsEmpty)
+            {
+                using var cPen = new Pen(Color.FromArgb(195, 235, 130, 30), Math.Max(3f, sqSize * 0.08f));
+                int inset = (int)(sqSize * 0.09f);
+                g.DrawEllipse(cPen, cr.X + inset, cr.Y + inset, cr.Width - inset * 2, cr.Height - inset * 2);
+            }
+        }
+
+        // 4. Draw Legal Move Dots / Capture Rings
         if (_selectedSquare.IsValid && _legalMovesFromSelected.Count > 0)
         {
             using var dotBrush = new SolidBrush(ChessTheme.LegalMoveDot);
@@ -340,13 +620,24 @@ public class ChessBoardControl : Control
             }
         }
 
-        // 4. Draw Tactical Arrows
+        // 5. Draw Tactical Arrows
         if (ShowArrows)
         {
             foreach (var arrow in _arrows)
             {
                 DrawArrow(g, arrow, boardRect);
             }
+        }
+
+        // 6. Draw User Right-Click Interactive Arrows & Preview
+        foreach (var arrow in _userArrows)
+        {
+            DrawArrow(g, arrow, boardRect);
+        }
+        if (_isRmbDragging && _rmbDownSquare.IsValid && _rmbCurrentSquare.IsValid && _rmbDownSquare != _rmbCurrentSquare)
+        {
+            var previewArrow = new BoardArrow(_rmbDownSquare, _rmbCurrentSquare, Color.FromArgb(160, 243, 156, 18), 14f, HasOutline: true);
+            DrawArrow(g, previewArrow, boardRect);
         }
 
         // 5. Draw Pieces
@@ -356,13 +647,244 @@ public class ChessBoardControl : Control
             var piece = _board[sq];
             if (!piece.IsEmpty)
             {
+                // Skip rendering on source square while being actively dragged
+                if (_isDragging && sq == _dragSquare)
+                {
+                    continue;
+                }
                 var sqRect = GetSquareRect(sq, boardRect);
                 ResourceManager.DrawPiece(g, piece, sqRect);
             }
         }
 
+        // Draw Dragged Piece centered under cursor with elevation shadow
+        if (_isDragging && _dragSquare.IsValid)
+        {
+            var piece = _board[_dragSquare];
+            if (!piece.IsEmpty)
+            {
+                int pSize = (int)(sqSize * 1.08f);
+                int px = _dragPosition.X - pSize / 2;
+                int py = _dragPosition.Y - pSize / 2;
+                var dragPieceRect = new Rectangle(px, py, pSize, pSize);
+
+                // Subtle lift drop shadow
+                using (var shadowBrush = new SolidBrush(Color.FromArgb(70, 0, 0, 0)))
+                {
+                    g.FillEllipse(shadowBrush, px + 4, py + 8, pSize - 8, pSize - 12);
+                }
+
+                ResourceManager.DrawPiece(g, piece, dragPieceRect);
+            }
+        }
+
         // 6. Draw Animated Pill or Corner Badge
         DrawAnimatedPillOrBadge(g, boardRect);
+
+        // 7. Draw King Badges (Checkmate, Resignation, Stalemate/Draw, Victory)
+        DrawKingBadges(g, boardRect);
+    }
+
+    private void DrawKingBadges(Graphics g, Rectangle boardRect)
+    {
+        var sideToMove = _board.SideToMove;
+        var enemySide = sideToMove == PieceColor.White ? PieceColor.Black : PieceColor.White;
+        var kingToMoveSq = _board.FindKing(sideToMove);
+        var enemyKingSq = _board.FindKing(enemySide);
+
+        int legalCount = _board.GenerateLegalMoves().Count;
+        bool isCheckmate = _board.IsInCheck(sideToMove) && legalCount == 0;
+        bool isStalemate = !_board.IsInCheck(sideToMove) && legalCount == 0;
+
+        // A. On-board Checkmate (with smooth 0.5s transition animation from full square to corner)
+        if (isCheckmate)
+        {
+            if (_mateActive && _mateStopwatch.ElapsedMilliseconds <= 500)
+            {
+                float t = Math.Clamp(_mateStopwatch.ElapsedMilliseconds / 500.0f, 0f, 1f);
+                float ease = (float)(1.0 - Math.Pow(1.0 - t, 3)); // Cubic ease out
+
+                float sqSize = boardRect.Width / 8.0f;
+                float startSize = sqSize * 0.90f;
+                float endSize = Math.Max(24f, sqSize * 0.40f);
+                float curSize = startSize + (endSize - startSize) * ease;
+
+                // Animate checkmate badge on loser king
+                if (kingToMoveSq.IsValid)
+                {
+                    var kRect = GetSquareRect(kingToMoveSq, boardRect);
+                    float startX = kRect.X + (sqSize - startSize) / 2f;
+                    float startY = kRect.Y + (sqSize - startSize) / 2f;
+                    float endX = kRect.Right - endSize * 0.75f;
+                    float endY = kRect.Top - endSize * 0.25f;
+
+                    float curX = startX + (endX - startX) * ease;
+                    float curY = startY + (endY - startY) * ease;
+
+                    var img = ResourceManager.GetCheckmateBadge();
+                    if (img != null) g.DrawImage(img, new RectangleF(curX, curY, curSize, curSize));
+                }
+
+                // Animate victory crown/badge on winner king
+                if (enemyKingSq.IsValid)
+                {
+                    var eRect = GetSquareRect(enemyKingSq, boardRect);
+                    float startX = eRect.X + (sqSize - startSize) / 2f;
+                    float startY = eRect.Y + (sqSize - startSize) / 2f;
+                    float endX = eRect.Right - endSize * 0.75f;
+                    float endY = eRect.Top - endSize * 0.25f;
+
+                    float curX = startX + (endX - startX) * ease;
+                    float curY = startY + (endY - startY) * ease;
+
+                    var img = ResourceManager.GetWinBadge();
+                    if (img != null) g.DrawImage(img, new RectangleF(curX, curY, curSize, curSize));
+                }
+            }
+            else
+            {
+                if (kingToMoveSq.IsValid)
+                {
+                    var kingRect = GetSquareRect(kingToMoveSq, boardRect);
+                    ResourceManager.DrawCheckmateBadge(g, kingRect, boardRect);
+                }
+                if (enemyKingSq.IsValid)
+                {
+                    var enemyRect = GetSquareRect(enemyKingSq, boardRect);
+                    ResourceManager.DrawWinBadge(g, enemyRect, boardRect);
+                }
+            }
+            return;
+        }
+
+        // B. Stalemate / Draw (On-board or PGN Draw)
+        bool isDrawResult = IsAtGameEnd && (GameResult is "1/2-1/2" or "0-0" or "½-½");
+        if (isStalemate || isDrawResult)
+        {
+            var whiteKingSq = _board.FindKing(PieceColor.White);
+            var blackKingSq = _board.FindKing(PieceColor.Black);
+
+            if (_mateActive && _mateStopwatch.ElapsedMilliseconds <= 500)
+            {
+                float t = Math.Clamp(_mateStopwatch.ElapsedMilliseconds / 500.0f, 0f, 1f);
+                float ease = (float)(1.0 - Math.Pow(1.0 - t, 3));
+
+                float sqSize = boardRect.Width / 8.0f;
+                float startSize = sqSize * 0.90f;
+                float endSize = Math.Max(24f, sqSize * 0.40f);
+                float curSize = startSize + (endSize - startSize) * ease;
+
+                var img = ResourceManager.GetDrawBadge();
+                if (img != null)
+                {
+                    if (whiteKingSq.IsValid)
+                    {
+                        var wRect = GetSquareRect(whiteKingSq, boardRect);
+                        float startX = wRect.X + (sqSize - startSize) / 2f;
+                        float startY = wRect.Y + (sqSize - startSize) / 2f;
+                        float endX = wRect.Right - endSize * 0.75f;
+                        float endY = wRect.Top - endSize * 0.25f;
+                        float curX = startX + (endX - startX) * ease;
+                        float curY = startY + (endY - startY) * ease;
+                        g.DrawImage(img, new RectangleF(curX, curY, curSize, curSize));
+                    }
+                    if (blackKingSq.IsValid)
+                    {
+                        var bRect = GetSquareRect(blackKingSq, boardRect);
+                        float startX = bRect.X + (sqSize - startSize) / 2f;
+                        float startY = bRect.Y + (sqSize - startSize) / 2f;
+                        float endX = bRect.Right - endSize * 0.75f;
+                        float endY = bRect.Top - endSize * 0.25f;
+                        float curX = startX + (endX - startX) * ease;
+                        float curY = startY + (endY - startY) * ease;
+                        g.DrawImage(img, new RectangleF(curX, curY, curSize, curSize));
+                    }
+                }
+            }
+            else
+            {
+                if (whiteKingSq.IsValid)
+                {
+                    ResourceManager.DrawDrawBadge(g, GetSquareRect(whiteKingSq, boardRect), boardRect);
+                }
+                if (blackKingSq.IsValid)
+                {
+                    ResourceManager.DrawDrawBadge(g, GetSquareRect(blackKingSq, boardRect), boardRect);
+                }
+            }
+            return;
+        }
+
+        // C. Game End from PGN (Resignation, Timeout, Draw by agreement/rules)
+        if (IsAtGameEnd && !string.IsNullOrWhiteSpace(GameResult) && !isCheckmate && !isStalemate)
+        {
+            var whiteKingSq = _board.FindKing(PieceColor.White);
+            var blackKingSq = _board.FindKing(PieceColor.Black);
+
+            bool isWhiteWin = GameResult == "1-0";
+            bool isBlackWin = GameResult == "0-1";
+            bool isDraw = GameResult is "1/2-1/2" or "0-0" or "½-½";
+
+            if (isWhiteWin || isBlackWin)
+            {
+                var winnerSq = isWhiteWin ? whiteKingSq : blackKingSq;
+                var loserSq = isWhiteWin ? blackKingSq : whiteKingSq;
+
+                if (_mateActive && _mateStopwatch.ElapsedMilliseconds <= 500)
+                {
+                    float t = Math.Clamp(_mateStopwatch.ElapsedMilliseconds / 500.0f, 0f, 1f);
+                    float ease = (float)(1.0 - Math.Pow(1.0 - t, 3));
+
+                    float sqSize = boardRect.Width / 8.0f;
+                    float startSize = sqSize * 0.90f;
+                    float endSize = Math.Max(24f, sqSize * 0.40f);
+                    float curSize = startSize + (endSize - startSize) * ease;
+
+                    if (loserSq.IsValid)
+                    {
+                        var lRect = GetSquareRect(loserSq, boardRect);
+                        float curX = lRect.X + (sqSize - startSize) / 2f + (lRect.Right - endSize * 0.75f - (lRect.X + (sqSize - startSize) / 2f)) * ease;
+                        float curY = lRect.Y + (sqSize - startSize) / 2f + (lRect.Top - endSize * 0.25f - (lRect.Y + (sqSize - startSize) / 2f)) * ease;
+                        var img = ResourceManager.GetResignBadge();
+                        if (img != null) g.DrawImage(img, new RectangleF(curX, curY, curSize, curSize));
+                    }
+                    if (winnerSq.IsValid)
+                    {
+                        var wRect = GetSquareRect(winnerSq, boardRect);
+                        float curX = wRect.X + (sqSize - startSize) / 2f + (wRect.Right - endSize * 0.75f - (wRect.X + (sqSize - startSize) / 2f)) * ease;
+                        float curY = wRect.Y + (sqSize - startSize) / 2f + (wRect.Top - endSize * 0.25f - (wRect.Y + (sqSize - startSize) / 2f)) * ease;
+                        var img = ResourceManager.GetWinBadge();
+                        if (img != null) g.DrawImage(img, new RectangleF(curX, curY, curSize, curSize));
+                    }
+                }
+                else
+                {
+                    if (winnerSq.IsValid)
+                    {
+                        var wRect = GetSquareRect(winnerSq, boardRect);
+                        ResourceManager.DrawWinBadge(g, wRect, boardRect);
+                    }
+                    if (loserSq.IsValid)
+                    {
+                        var lRect = GetSquareRect(loserSq, boardRect);
+                        ResourceManager.DrawResignBadge(g, lRect, boardRect);
+                    }
+                }
+            }
+            else if (isDraw)
+            {
+                if (whiteKingSq.IsValid)
+                {
+                    var wRect = GetSquareRect(whiteKingSq, boardRect);
+                    ResourceManager.DrawDrawBadge(g, wRect, boardRect);
+                }
+                if (blackKingSq.IsValid)
+                {
+                    var bRect = GetSquareRect(blackKingSq, boardRect);
+                    ResourceManager.DrawDrawBadge(g, bRect, boardRect);
+                }
+            }
+        }
     }
 
     private void DrawArrow(Graphics g, BoardArrow arrow, Rectangle boardRect)
@@ -388,8 +910,9 @@ public class ChessBoardControl : Control
         float ny = ux;
 
         float sqSize = boardRect.Width / 8f;
-        float headLen = Math.Clamp(sqSize * 0.38f, 16f, 28f);
-        float headHalfWidth = headLen * 0.65f;
+        // Arrowhead size scaled with width
+        float headLen = Math.Clamp(sqSize * 0.44f, 22f, 36f);
+        float headHalfWidth = headLen * 0.70f;
 
         // Pull back tip slightly so it points cleanly into target square
         float endX = x2 - ux * (sqSize * 0.15f);
@@ -399,29 +922,32 @@ public class ChessBoardControl : Control
         float baseHeadY = endY - uy * headLen;
 
         PointF[] headPoints =
-        {
+        [
             new(endX, endY),
             new(baseHeadX + nx * headHalfWidth, baseHeadY + ny * headHalfWidth),
             new(baseHeadX - nx * headHalfWidth, baseHeadY - ny * headHalfWidth)
-        };
+        ];
 
-        // Outline / drop shadow for bright or explicitly outlined arrows
-        bool isBright = arrow.Color.R > 200 && arrow.Color.G > 200 && arrow.Color.B > 200;
-        if (isBright || arrow.HasOutline)
+        // Arrows twice as thick (default 14f) and twice as transparent (alpha = 105 instead of 204)
+        float arrowWidth = Math.Max(12f, arrow.Width);
+        int alpha = 105;
+        Color arrowColor = Color.FromArgb(alpha, arrow.Color.R, arrow.Color.G, arrow.Color.B);
+
+        if (arrow.HasOutline)
         {
-            using var outlinePen = new Pen(Color.FromArgb(170, 20, 20, 25), arrow.Width + 2.5f)
+            using var outlinePen = new Pen(Color.FromArgb(45, 20, 20, 25), arrowWidth + 3f)
             {
                 StartCap = LineCap.Round,
                 EndCap = LineCap.Flat
             };
             g.DrawLine(outlinePen, x1, y1, baseHeadX, baseHeadY);
 
-            using var outlineBrush = new SolidBrush(Color.FromArgb(170, 20, 20, 25));
+            using var outlineBrush = new SolidBrush(Color.FromArgb(45, 20, 20, 25));
             g.FillPolygon(outlineBrush, headPoints);
         }
 
-        using var brush = new SolidBrush(arrow.Color);
-        using var pen = new Pen(arrow.Color, arrow.Width)
+        using var brush = new SolidBrush(arrowColor);
+        using var pen = new Pen(arrowColor, arrowWidth)
         {
             StartCap = LineCap.Round,
             EndCap = LineCap.Flat
@@ -439,49 +965,61 @@ public class ChessBoardControl : Control
         if (!_lastMoveTo.IsValid || !_lastMoveBadge.HasValue) return;
 
         var destSqRect = GetSquareRect(_lastMoveTo, boardRect);
-        int badgeSize = Math.Min(40, Math.Max(22, (int)(destSqRect.Width * 0.42f)));
-        int targetX = destSqRect.Right - badgeSize - 2;
-        int targetY = destSqRect.Top + 2;
+        const int badgeSize = 40;
+        int targetX = destSqRect.Right - (badgeSize / 2);
+        int targetY = destSqRect.Top - (badgeSize / 2);
+
+        if (!boardRect.IsEmpty)
+        {
+            if (targetX + badgeSize > boardRect.Right - 2) targetX = boardRect.Right - badgeSize - 2;
+            if (targetY < boardRect.Top + 2) targetY = boardRect.Top + 2;
+            if (targetX < boardRect.Left + 2) targetX = boardRect.Left + 2;
+            if (targetY + badgeSize > boardRect.Bottom - 2) targetY = boardRect.Bottom - badgeSize - 2;
+        }
 
         if (_pillActive && (_lastMoveBadge == MoveClassification.Brilliant || _lastMoveBadge == MoveClassification.Great))
         {
             long ms = _pillStopwatch.ElapsedMilliseconds;
-            if (ms > 600)
+            if (ms > 750)
             {
                 _pillActive = false;
                 _pillTimer.Stop();
-                ResourceManager.DrawCornerBadge(g, _lastMoveBadge.Value, destSqRect);
+                ResourceManager.DrawCornerBadge(g, _lastMoveBadge.Value, destSqRect, boardRect);
                 return;
             }
 
-            string pillText = _lastMoveBadge == MoveClassification.Brilliant ? "Блестящий ход!" : "Сильный ход!";
+            string pillText = _lastMoveBadge == MoveClassification.Brilliant ? "Блестящий ход!" : "Замечательный ход!";
             Color textColor = _lastMoveBadge == MoveClassification.Brilliant
                 ? Color.FromArgb(22, 160, 133)
                 : Color.FromArgb(74, 136, 199);
 
-            float initWidth = Math.Max(180f, destSqRect.Width * 1.8f);
-            float initHeight = 36f;
+            float fontSize = 11.5f;
+            using var font = new Font("Segoe UI", fontSize, FontStyle.Bold);
+            SizeF textSize = g.MeasureString(pillText, font);
+
+            // Овал пропорциональный увеличенному шрифту с щедрым запасом (36px), чтобы текст никогда не обрезался
+            float initWidth = (float)Math.Ceiling(textSize.Width + 36f);
+            float initHeight = 32f;
             float initX = Math.Clamp(destSqRect.X + (destSqRect.Width - initWidth) / 2f, boardRect.Left + 6, boardRect.Right - initWidth - 6);
-            float initY = Math.Max(boardRect.Top + 6, destSqRect.Y - initHeight * 0.7f);
+            float initY = Math.Max(boardRect.Top + 6, destSqRect.Y - initHeight * 0.75f);
 
             float curX, curY, curW, curH;
             float textAlpha = 1.0f;
             float badgeAlpha = 0.0f;
 
-            if (ms <= 120)
+            if (ms <= 100)
             {
-                // Quick punchy Pop In (0..120ms)
-                float t = ms / 120f;
-                float scale = 0.6f + 0.4f * t;
-                curW = initWidth * scale;
-                curH = initHeight * scale;
-                curX = initX + (initWidth - curW) / 2f;
-                curY = initY + (initHeight - curH) / 2f;
+                // Плавное появление и всплытие (0..100ms) без сжатия ширины
+                float t = ms / 100f;
+                curW = initWidth;
+                curH = initHeight;
+                curX = initX;
+                curY = initY + (1f - t) * 4f;
                 textAlpha = t;
             }
-            else if (ms <= 320)
+            else if (ms <= 450)
             {
-                // Brief readable hold (120..320ms)
+                // Удержание овала ровно 0.35 секунд (350ms, 100..450ms) в статичном читаемом виде
                 curX = initX;
                 curY = initY;
                 curW = initWidth;
@@ -490,8 +1028,8 @@ public class ChessBoardControl : Control
             }
             else
             {
-                // Smooth collapse and fold towards corner into PNG badge (320..600ms)
-                float t = (ms - 320) / 280f;
+                // Плавное складывание овала к углу клетки в круглый значок (450..750ms)
+                float t = (ms - 450) / 300f;
                 float smoothT = (float)(t < 0.5 ? 2 * t * t : 1 - Math.Pow(-2 * t + 2, 2) / 2);
 
                 curX = initX + (targetX - initX) * smoothT;
@@ -499,8 +1037,10 @@ public class ChessBoardControl : Control
                 curW = initWidth + (badgeSize - initWidth) * smoothT;
                 curH = initHeight + (badgeSize - initHeight) * smoothT;
 
-                textAlpha = Math.Clamp(1.0f - smoothT * 2.5f, 0f, 1f);
-                badgeAlpha = Math.Clamp((smoothT - 0.35f) * 1.6f, 0f, 1f);
+                // Текст плавно и быстро исчезает в начале складывания (за первые 70ms),
+                // чтобы он никогда не ужимался и не обрезался по краям
+                textAlpha = Math.Clamp(1.0f - (ms - 450) / 70f, 0f, 1f);
+                badgeAlpha = Math.Clamp((smoothT - 0.25f) * 1.5f, 0f, 1f);
             }
 
             var curRect = new RectangleF(curX, curY, curW, curH);
@@ -519,15 +1059,15 @@ public class ChessBoardControl : Control
             DrawRoundedPill(g, borderPen, curRect, curH / 2f);
 
             // Text
-            if (textAlpha > 0.05f)
+            if (textAlpha > 0.05f && curW >= textSize.Width + 10f)
             {
                 int textAlphaByte = (int)(textAlpha * 255);
                 using var textBrush = new SolidBrush(Color.FromArgb(textAlphaByte, textColor));
-                using var font = new Font("Segoe UI", Math.Max(7, curH * 0.42f), FontStyle.Bold);
                 var sf = new StringFormat
                 {
                     Alignment = StringAlignment.Center,
-                    LineAlignment = StringAlignment.Center
+                    LineAlignment = StringAlignment.Center,
+                    FormatFlags = StringFormatFlags.NoWrap
                 };
                 g.DrawString(pillText, font, textBrush, curRect, sf);
             }
@@ -543,14 +1083,14 @@ public class ChessBoardControl : Control
                 }
                 else
                 {
-                    ResourceManager.DrawCornerBadge(g, _lastMoveBadge.Value, destSqRect);
+                    ResourceManager.DrawCornerBadge(g, _lastMoveBadge.Value, destSqRect, boardRect);
                 }
             }
         }
         else
         {
             // Static Corner Badge
-            ResourceManager.DrawCornerBadge(g, _lastMoveBadge.Value, destSqRect);
+            ResourceManager.DrawCornerBadge(g, _lastMoveBadge.Value, destSqRect, boardRect);
         }
     }
 

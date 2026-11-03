@@ -1,10 +1,13 @@
 using System.Text;
 using System.Text.RegularExpressions;
+using ChessAnalysis.Core.Analysis;
 
 namespace ChessAnalysis.Core.Chess;
 
 public static partial class PgnParser
 {
+    public static PgnGame Parse(string pgnText) => ParseSingleGame(pgnText) ?? new PgnGame();
+
     public static List<PgnGame> ParseGames(string pgnText)
     {
         var games = new List<PgnGame>();
@@ -41,7 +44,7 @@ public static partial class PgnParser
     {
         if (string.IsNullOrWhiteSpace(rawGame)) return null;
 
-        var game = new PgnGame();
+        var game = new PgnGame { RawPgn = rawGame };
         var lines = rawGame.Split('\n');
         var movesBuilder = new StringBuilder();
 
@@ -98,6 +101,11 @@ public static partial class PgnParser
 
         var board = new BoardState();
         int currentMoveNum = 1;
+        if (game.Headers.TryGetValue("FEN", out var customFen) && !string.IsNullOrWhiteSpace(customFen))
+        {
+            board.LoadFen(customFen);
+            currentMoveNum = board.FullmoveNumber;
+        }
         PgnMove? lastMove = null;
 
         foreach (Match match in matches)
@@ -130,12 +138,67 @@ public static partial class PgnParser
                         }
                         lastMove.Clock = rawClk;
                     }
+
+                    // Extract [%c_effect ... type;...]
+                    var effectMatches = Regex.Matches(commentContent, @"type;([A-Za-z]+)", RegexOptions.IgnoreCase);
+                    foreach (Match em in effectMatches)
+                    {
+                        string effectType = em.Groups[1].Value.ToLowerInvariant();
+                        if (lastMove.ExpectedClassification == null)
+                        {
+                            lastMove.ExpectedClassification = effectType switch
+                            {
+                                "brilliant" => MoveClassification.Brilliant,
+                                "greatfind" or "great" => MoveClassification.Great,
+                                "best" => MoveClassification.Best,
+                                "excellent" => MoveClassification.Excellent,
+                                "good" => MoveClassification.Good,
+                                "book" => MoveClassification.Book,
+                                "forced" => MoveClassification.Forced,
+                                "inaccuracy" => MoveClassification.Inaccuracy,
+                                "mistake" => MoveClassification.Mistake,
+                                "blunder" => MoveClassification.Blunder,
+                                "miss" or "missedwin" => MoveClassification.MissedWin,
+                                _ => null
+                            };
+                        }
+
+                        if (effectType is "resignwhite" or "resignblack")
+                        {
+                            game.Headers["TerminationType"] = "Resignation";
+                        }
+                        else if (effectType is "checkmatewhite" or "checkmateblack")
+                        {
+                            game.Headers["TerminationType"] = "Checkmate";
+                        }
+                        else if (effectType is "drawwhite" or "drawblack")
+                        {
+                            game.Headers["TerminationType"] = "Draw";
+                        }
+                    }
                 }
                 continue;
             }
 
-            // Skip NAGs
-            if (tok.StartsWith("$")) continue;
+            // Handle NAGs ($1, $2, $3, $4, $5, $6, $9, etc.)
+            if (tok.StartsWith("$"))
+            {
+                if (int.TryParse(tok[1..], out int nag) && lastMove != null && lastMove.ExpectedClassification == null)
+                {
+                    lastMove.ExpectedClassification = nag switch
+                    {
+                        1 => MoveClassification.Great,
+                        2 => MoveClassification.Mistake,
+                        3 => MoveClassification.Brilliant,
+                        4 => MoveClassification.Blunder,
+                        5 => MoveClassification.Good,
+                        6 => MoveClassification.Inaccuracy,
+                        9 => MoveClassification.MissedWin,
+                        _ => null
+                    };
+                }
+                continue;
+            }
 
             // Check for game termination
             if (tok is "1-0" or "0-1" or "1/2-1/2" or "*")
@@ -145,6 +208,12 @@ public static partial class PgnParser
                     game.Headers["Result"] = tok;
                 }
                 break;
+            }
+
+            // Pure dots like "...", "..", "."
+            if (tok.Length > 0 && tok.All(c => c == '.'))
+            {
+                continue;
             }
 
             // Move numbers like "1.", "1...", "24."
@@ -170,13 +239,42 @@ public static partial class PgnParser
                 if (string.IsNullOrEmpty(tok)) continue;
             }
 
+            tok = tok.TrimStart('.');
+
+            // Extract user annotation tag like "-G1", "-N2", "-B3"
+            MoveClassification? expectedClass = null;
+            string? annotationTag = null;
+            var tagMatch = Regex.Match(tok, @"-(G[1-3]|N[1-3]|B[1-4]|M1)$", RegexOptions.IgnoreCase);
+            if (tagMatch.Success)
+            {
+                string tag = tagMatch.Groups[1].Value.ToUpperInvariant();
+                annotationTag = tag;
+                expectedClass = tag switch
+                {
+                    "G1" => MoveClassification.Brilliant,
+                    "G2" => MoveClassification.Great,
+                    "G3" => MoveClassification.Book,
+                    "N1" => MoveClassification.Best,
+                    "N2" => MoveClassification.Excellent,
+                    "N3" => MoveClassification.Good,
+                    "B1" => MoveClassification.Inaccuracy,
+                    "B2" => MoveClassification.Mistake,
+                    "B3" => MoveClassification.Blunder,
+                    "B4" => MoveClassification.MissedWin,
+                    "M1" => MoveClassification.Forced,
+                    _ => null
+                };
+                tok = tok[..tagMatch.Index];
+            }
+
             // Try to parse SAN move
+            string cleanSan = tok;
             string fenBefore = board.ToFen();
-            var move = board.ParseSan(tok);
+            var move = board.ParseSan(cleanSan);
             if (move.IsEmpty)
             {
                 // If it fails, try trimming any trailing annotation characters like ! or ?
-                move = board.ParseSan(tok.TrimEnd('!', '?', '+', '#'));
+                move = board.ParseSan(cleanSan.TrimEnd('!', '?', '+', '#'));
             }
 
             if (!move.IsEmpty)
@@ -189,10 +287,12 @@ public static partial class PgnParser
                 {
                     MoveNumber = currentMoveNum,
                     Color = side,
-                    San = tok,
+                    San = cleanSan,
                     Move = move,
                     FenBefore = fenBefore,
-                    FenAfter = fenAfter
+                    FenAfter = fenAfter,
+                    ExpectedClassification = expectedClass,
+                    AnnotationTag = annotationTag
                 };
 
                 game.Moves.Add(pgnMove);
