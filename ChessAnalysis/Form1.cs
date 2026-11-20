@@ -1746,6 +1746,13 @@ public partial class Form1 : Form
         for (int i = 0; i < moveCount; i++)
         {
             string uci = pv[i];
+            var mv = Core.Chess.Move.FromUci(uci);
+            if (mv.IsEmpty) break;
+
+            var legalMoves = tempBoard.GenerateLegalMoves();
+            var matchedLegalMove = legalMoves.FirstOrDefault(m => m.From == mv.From && m.To == mv.To && m.Promotion == mv.Promotion);
+            if (matchedLegalMove.IsEmpty) break;
+
             string san = AnalysisService.ConvertUciToSan(tempBoard.ToFen(), uci);
             if (string.IsNullOrEmpty(san)) san = uci;
 
@@ -1765,9 +1772,7 @@ public partial class Form1 : Form
                 parts.Add(san);
             }
 
-            var mv = Core.Chess.Move.FromUci(uci);
-            if (mv.IsEmpty) break;
-            tempBoard.ApplyMove(mv);
+            tempBoard.ApplyMove(matchedLegalMove);
         }
 
         return string.Join(" ", parts) + (pv.Count > moveCount ? "..." : "");
@@ -2221,8 +2226,10 @@ public partial class Form1 : Form
                 {
                     if (!ct.IsCancellationRequested && _boardControl.Board.ToFen() == fen)
                     {
+                        var snapshot = new BoardState();
+                        snapshot.LoadFen(fen);
                         _evalBar.SetEvaluation(eval);
-                        _computerLines.SetLines(eval, _boardControl.Board);
+                        _computerLines.SetLines(eval, snapshot);
                         _currentFenEval = eval;
                         _currentEvalFen = fen;
                     }
@@ -2470,12 +2477,14 @@ public partial class Form1 : Form
                         {
                             Invoke(() =>
                             {
-                                if (_currentPlyIndex == targetPly && !_isAnalyzingGame)
+                                if (_currentPlyIndex == targetPly && !_isAnalyzingGame && !ct.IsCancellationRequested && _boardControl.Board.ToFen() == fenToAnalyze)
                                 {
+                                    var snapshot = new BoardState();
+                                    snapshot.LoadFen(fenToAnalyze);
                                     _currentFenEval = eval;
                                     _currentEvalFen = fenToAnalyze;
                                     _evalBar.SetEvaluation(eval);
-                                    _computerLines.SetLines(eval, board);
+                                    _computerLines.SetLines(eval, snapshot);
                                 }
                             });
                         }
@@ -2960,7 +2969,10 @@ public partial class Form1 : Form
             }
 
             var postEval = await _engine.AnalyzePositionAsync(fenAfter, depth: _analysisDepth, nodes: 600_000, ct: ct);
-            if (ct.IsCancellationRequested) return;
+            if (ct.IsCancellationRequested || _boardControl.Board.ToFen() != fenAfter) return;
+
+            var boardSnapshot = new BoardState();
+            boardSnapshot.LoadFen(fenAfter);
 
             _currentFenEval = postEval;
             _currentEvalFen = fenAfter;
@@ -3006,7 +3018,7 @@ public partial class Form1 : Form
 
                 bool hasBetter = classification is MoveClassification.Blunder or MoveClassification.Mistake or MoveClassification.Inaccuracy or MoveClassification.MissedWin;
 
-                string playedCont = FormatPvLine(postEval.Pv, newBoard);
+                string playedCont = FormatPvLine(postEval.Pv, boardSnapshot);
                 string bestCont = FormatPvLine(preEval.Pv, boardBefore);
 
                 _moveReviewCard.Visible = true;
@@ -3039,7 +3051,7 @@ public partial class Form1 : Form
             }
 
             _evalBar.SetEvaluation(postEval);
-            _computerLines.SetLines(postEval, newBoard);
+            _computerLines.SetLines(postEval, boardSnapshot);
 
             _boardControl.ClearArrows();
         }

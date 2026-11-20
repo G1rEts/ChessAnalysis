@@ -304,17 +304,36 @@ public static class Program
         var clsKnightBlunder = MoveClassifier.Classify(pgnHangKnight, preEvalEqual, postEvalLost, 35.0, 20);
         AssertEqual(MoveClassification.Blunder, clsKnightBlunder, "Hanging a knight on e5 with net loss must be Blunder (??)");
 
-        // Real Blunder 2: Allowing forced mate in N from non-hopeless position (+3.00 to -M5)
+        // Mate classification tests per updated criteria:
+        // 1) Allowing mate when pre-position is already lost by > 9.0 (-10.00 to -M3) must be Inaccuracy (?!)
+        var preEvalHopeless = new EngineEvaluation { BestMoveUci = "e2e4", Centipawns = -1000 };
+        var postEvalM3 = new EngineEvaluation { Centipawns = -100000, MateInMoves = -3 };
+        var clsHopelessInaccuracy = MoveClassifier.Classify(pgnPosMistake, preEvalHopeless, postEvalM3, 10.0, 20);
+        AssertEqual(MoveClassification.Inaccuracy, clsHopelessInaccuracy, "Allowing mate when position already lost by > 9.0 (-10.00) must be Inaccuracy (?!)");
+
+        // 2) Allowing mate when pre-position is lost by > 6.5 (-7.50 to -M3) must be Mistake (?)
+        var preEvalLost65 = new EngineEvaluation { BestMoveUci = "e2e4", Centipawns = -750 };
+        var clsLostMistake = MoveClassifier.Classify(pgnPosMistake, preEvalLost65, postEvalM3, 15.0, 20);
+        AssertEqual(MoveClassification.Mistake, clsLostMistake, "Allowing mate when position is lost by > 6.5 (-7.50) must be Mistake (?)");
+
+        // 3) Allowing mate from non-hopeless position (+3.00 to -M5) must be Blunder (??)
         var preEvalPlus3 = new EngineEvaluation { BestMoveUci = "e2e4", Centipawns = 300 };
         var postEvalM5 = new EngineEvaluation { Centipawns = -100000, MateInMoves = -5 };
         var clsMateBlunder = MoveClassifier.Classify(pgnPosMistake, preEvalPlus3, postEvalM5, 50.0, 20);
-        AssertEqual(MoveClassification.Blunder, clsMateBlunder, "Allowing mate in 5 from non-hopeless position (+3.00) must be Blunder (??)");
+        AssertEqual(MoveClassification.Blunder, clsMateBlunder, "Allowing mate from non-hopeless position (+3.00) must be Blunder (??)");
 
-        // Real Mistake 3: Allowing mate in N when already hopeless (-10.00 to -M3) must be Mistake (?)
-        var preEvalHopeless = new EngineEvaluation { BestMoveUci = "e2e4", Centipawns = -1000 };
-        var postEvalM3 = new EngineEvaluation { Centipawns = -100000, MateInMoves = -3 };
-        var clsHopelessMistake = MoveClassifier.Classify(pgnPosMistake, preEvalHopeless, postEvalM3, 10.0, 20);
-        AssertEqual(MoveClassification.Mistake, clsHopelessMistake, "Allowing mate in 3 when already -10.00 must be Mistake (?), NOT Blunder (??)");
+        // Good vs Inaccuracy in near-equal positions:
+        // Case A: Near equal (+0.4 to -0.2) must be Good
+        var preEvalPlus04 = new EngineEvaluation { BestMoveUci = "e2e4", Centipawns = 40 };
+        var postEvalMinus02 = new EngineEvaluation { Centipawns = -20 };
+        var clsGoodMove = MoveClassifier.Classify(pgnPosMistake, preEvalPlus04, postEvalMinus02, 5.7, 20);
+        AssertEqual(MoveClassification.Good, clsGoodMove, "Slight drop from +0.4 to -0.2 in near-equal position must be Good (✓)");
+
+        // Case B: Near equal (0.0 to -1.6) giving opponent initiative must be Inaccuracy, NOT Good
+        var preEvalEqual0 = new EngineEvaluation { BestMoveUci = "e2e4", Centipawns = 0 };
+        var postEvalMinus16 = new EngineEvaluation { Centipawns = -160 };
+        var clsInaccuracyDrop = MoveClassifier.Classify(pgnPosMistake, preEvalEqual0, postEvalMinus16, 14.3, 20);
+        AssertEqual(MoveClassification.Inaccuracy, clsInaccuracyDrop, "Drop from 0.0 to -1.6 ceding initiative must be Inaccuracy (?!), NOT Good");
     }
     #endregion
 

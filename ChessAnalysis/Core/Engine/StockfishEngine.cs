@@ -444,7 +444,7 @@ public class StockfishEngine : IDisposable
                         int pvIdx = line.IndexOf(" pv ");
                         List<string> currentLinePv = pvIdx >= 0
                             ? line[(pvIdx + 4)..].Split(' ', StringSplitOptions.RemoveEmptyEntries).ToList()
-                            : new List<string>();
+                            : (linesDict.TryGetValue(multipv, out var existingLine) ? existingLine.Pv : new List<string>());
 
                         linesDict[multipv] = new EngineLine
                         {
@@ -458,7 +458,7 @@ public class StockfishEngine : IDisposable
                         {
                             bestCpSide = cp;
                             bestMateSide = mate;
-                            pvMoves = currentLinePv;
+                            if (currentLinePv.Count > 0) pvMoves = currentLinePv;
                         }
                         else if (multipv == 2)
                         {
@@ -472,22 +472,12 @@ public class StockfishEngine : IDisposable
             }
             catch (OperationCanceledException)
             {
-                // Engine search cancelled: send stop, drain stream and synchronize with isready
+                // Engine search cancelled: send stop and isready, drain until readyok
                 try
                 {
                     if (_process is { HasExited: false } && _input != null)
                     {
-                        await _input.WriteLineAsync("stop");
-                        await _input.FlushAsync();
-
-                        using var drainCts = new CancellationTokenSource(600);
-                        while (!drainCts.IsCancellationRequested)
-                        {
-                            string? drainLine = await _process.StandardOutput.ReadLineAsync(drainCts.Token);
-                            if (drainLine == null || drainLine.StartsWith("bestmove")) break;
-                        }
-
-                        // Synchronize UCI state
+                        SendCommandDirect("stop");
                         SendCommandDirect("isready");
                         await WaitForResponseDirectAsync("readyok", 1500);
                     }

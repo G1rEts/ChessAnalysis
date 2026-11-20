@@ -9,6 +9,9 @@
     <NoWarn>$(NoWarn);WFO1000</NoWarn>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
     <SatelliteResourceLanguages>ru;en</SatelliteResourceLanguages>
+    <Version>1.1.0</Version>
+    <AssemblyVersion>1.1.0.0</AssemblyVersion>
+    <FileVersion>1.1.0.0</FileVersion>
   </PropertyGroup>
 
   <ItemGroup>

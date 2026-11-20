@@ -157,6 +157,13 @@ public class ComputerLinesControl : UserControl
         for (int i = 0; i < moveCount; i++)
         {
             string uci = pv[i];
+            var mv = Core.Chess.Move.FromUci(uci);
+            if (mv.IsEmpty) break;
+
+            var legalMoves = tempBoard.GenerateLegalMoves();
+            var matchedLegalMove = legalMoves.FirstOrDefault(m => m.From == mv.From && m.To == mv.To && m.Promotion == mv.Promotion);
+            if (matchedLegalMove.IsEmpty) break;
+
             string san = AnalysisService.ConvertUciToSan(tempBoard.ToFen(), uci);
             if (string.IsNullOrEmpty(san)) san = uci;
 
@@ -176,9 +183,7 @@ public class ComputerLinesControl : UserControl
                 parts.Add(san);
             }
 
-            var mv = Core.Chess.Move.FromUci(uci);
-            if (mv.IsEmpty) break;
-            tempBoard.ApplyMove(mv);
+            tempBoard.ApplyMove(matchedLegalMove);
         }
 
         return string.Join(" ", parts) + (pv.Count > moveCount ? "..." : "");

@@ -119,8 +119,10 @@ public static class MoveClassifier
         int minPostEvalForBrilliant = weights.BrilliantMinPostEvalCp;
 
         bool preEvalAllowed = preEvalForPlayer <= maxPreEvalForBrilliant || isMatingForPlayer;
+        bool isEligibleEngineMoveForBrilliant = isTopEngineMove ||
+                                              (matchedMultiPv.HasValue && (matchedMultiPv.Value == 1 || matchedMultiPv.Value == 2));
 
-        if (isTopEngineMove && preEvalAllowed &&
+        if (isEligibleEngineMoveForBrilliant && preEvalAllowed &&
             (evalForPlayer >= minPostEvalForBrilliant || isMatingForPlayer))
         {
             if (IsSacrifice(pgnMove, out _, playerRating))
@@ -180,14 +182,19 @@ public static class MoveClassifier
         // 8. Отличный ход (N2 / 👍):
         // Сверка по MultiPV (линии 2 и 3 с близким отрывом от первой)
         // либо дельта вероятности <= 9.5%, либо потеря пешек <= 140 CP
-        bool isMultiPvExcellent = matchedMultiPv.HasValue &&
+        bool isNearEqual = preEvalForPlayer >= -150 && preEvalForPlayer <= 200;
+        bool droppedToNegativeAdvantage = isNearEqual && evalForPlayer <= -100 && (cpLoss >= 80 || deltaP >= 8.0);
+        bool droppedFromPlusToMinus = preEvalForPlayer >= 0 && evalForPlayer < 0 && cpLoss >= 40;
+
+        bool isMultiPvExcellent = !droppedToNegativeAdvantage && !droppedFromPlusToMinus &&
+                                  matchedMultiPv.HasValue &&
                                   matchedMultiPv.Value is 2 or 3 &&
                                   matchedLineCpMargin <= weights.MultiPvExcellentCpMargin;
 
         bool isWinningPosition = preEvalForPlayer >= 350 && evalForPlayer >= 250;
 
-        if (isMultiPvExcellent ||
-            (deltaP <= weights.ExcellentMaxDeltaP && (cpLoss <= weights.ExcellentMaxCpLoss || isWinningPosition)))
+        if (!droppedToNegativeAdvantage && !droppedFromPlusToMinus && (isMultiPvExcellent ||
+            (deltaP <= weights.ExcellentMaxDeltaP && (cpLoss <= weights.ExcellentMaxCpLoss || isWinningPosition))))
         {
             return MoveClassification.Excellent;
         }
@@ -195,12 +202,15 @@ public static class MoveClassifier
         // 9. Неплохой ход (N3 / ✓):
         // Сверка по MultiPV (линии 2, 3, 4 с приемлемым отрывом)
         // либо дельта вероятности <= 13.0%, либо потеря пешек <= 240 CP в выигранной позиции
-        bool isMultiPvGood = matchedMultiPv.HasValue &&
+        bool isMultiPvGood = !droppedToNegativeAdvantage &&
+                             matchedMultiPv.HasValue &&
                              matchedMultiPv.Value is 2 or 3 or 4 &&
                              matchedLineCpMargin <= weights.MultiPvGoodCpMargin;
 
-        if (isMultiPvGood ||
-            (deltaP <= weights.GoodMaxDeltaP && (cpLoss <= weights.GoodMaxCpLoss || isWinningPosition)))
+        double maxGoodCpLoss = isWinningPosition ? weights.GoodMaxCpLoss : 100.0;
+
+        if (!droppedToNegativeAdvantage && (isMultiPvGood ||
+            (deltaP <= weights.GoodMaxDeltaP && (cpLoss <= maxGoodCpLoss || isWinningPosition))))
         {
             return MoveClassification.Good;
         }
@@ -212,21 +222,35 @@ public static class MoveClassifier
             return MoveClassification.Inaccuracy;
         }
 
-        // 11. Классификация ошибок в остальных позициях
-        // Зевок (Blunder) присуждается, только если:
-        // 1) ход допускает мат в N ходов для соперника (при условии, что до хода позиция не была безнадежной, например <= -800)
-        // 2) ИЛИ отдается фигура ни за что (не являясь жертвой), т.е. зевок материала.
-        // Если же позиция просто сильно ухудшилась (например, было +1.4, стало +4.0 у соперника)
-        // без зевка фигуры или мата, то это Ошибка (Mistake), а не Зевок!
+        // 11. Классификация ошибок и зевков:
+        // Проверка допуска форсированного мата сопернику:
+        // - если позиция уже была безнадежно проиграна (> 9.0 пешек или уже стоял мат) -> Неточность (Inaccuracy)
+        // - если позиция была проиграна (> 6.5 пешек) -> Ошибка (Mistake)
+        // - во всех остальных случаях (ниже 6.5 пешек) -> Зевок (Blunder)
         bool allowsOpponentMate = postEval.MateInMoves.HasValue &&
             (pgnMove.Color == PieceColor.White ? postEval.MateInMoves.Value < 0 : postEval.MateInMoves.Value > 0);
-        bool wasHopelessBefore = preEvalForPlayer <= -800 ||
-            (preEval.MateInMoves.HasValue && (pgnMove.Color == PieceColor.White ? preEval.MateInMoves.Value < 0 : preEval.MateInMoves.Value > 0));
+        bool preHasOpponentMate = preEval.MateInMoves.HasValue &&
+            (pgnMove.Color == PieceColor.White ? preEval.MateInMoves.Value < 0 : preEval.MateInMoves.Value > 0);
+
+        if (allowsOpponentMate)
+        {
+            if (preEvalForPlayer <= -900.0 || preHasOpponentMate)
+            {
+                return MoveClassification.Inaccuracy;
+            }
+            if (preEvalForPlayer <= -650.0)
+            {
+                return MoveClassification.Mistake;
+            }
+            return MoveClassification.Blunder;
+        }
+
+        bool wasHopelessBefore = preEvalForPlayer <= -800.0 || preHasOpponentMate;
 
         // Катастрофический крах позиции в безнадежную (например с 0.0 до -9.8, оценка хуже -7.50)
         bool isCatastrophicCollapse = !wasHopelessBefore && evalForPlayer <= -750.0;
 
-        bool isTacticalBlunder = (allowsOpponentMate && !wasHopelessBefore) || IsPieceBlundered(pgnMove) || isCatastrophicCollapse;
+        bool isTacticalBlunder = IsPieceBlundered(pgnMove) || isCatastrophicCollapse;
 
         double blunderMinCp = (playerRating is >= 1500) ? 250.0 : weights.BlunderMinCpLoss;
         double blunderMinDeltaP = (playerRating is >= 1500) ? 24.0 : 28.0;
@@ -241,9 +265,9 @@ public static class MoveClassifier
         }
 
         double mistakeMinCp = (playerRating is >= 1500) ? 200.0 : weights.MistakeMinCpLoss;
-        double mistakeMinDeltaP = (playerRating is >= 1500) ? 12.0 : 14.0;
+        double mistakeMinDeltaP = (playerRating is >= 1500) ? 14.0 : 16.0;
 
-        if (deltaP >= mistakeMinDeltaP || (cpLoss >= mistakeMinCp && deltaP >= 10.0))
+        if ((deltaP >= mistakeMinDeltaP && cpLoss >= 180.0) || (cpLoss >= mistakeMinCp && deltaP >= 10.0))
         {
             return MoveClassification.Mistake;
         }

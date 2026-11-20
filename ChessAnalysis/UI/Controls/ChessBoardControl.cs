@@ -67,6 +67,9 @@ public class ChessBoardControl : Control
             _board = value ?? new BoardState();
             _selectedSquare = Square.None;
             _legalMovesFromSelected.Clear();
+            _isDragging = false;
+            _dragSquare = Square.None;
+            LastFenBefore = _board.ToFen();
             Invalidate();
         }
     }
@@ -153,6 +156,9 @@ public class ChessBoardControl : Control
         _lastMoveBadge = badge;
         _selectedSquare = Square.None;
         _legalMovesFromSelected.Clear();
+        _isDragging = false;
+        _dragSquare = Square.None;
+        LastFenBefore = _board.ToFen();
 
         if (animate && to.IsValid && (badge == MoveClassification.Brilliant || badge == MoveClassification.Great))
         {
